@@ -1,0 +1,10 @@
+target/
+*.exe
+*.wasm
+*.html
+*.o
+*.ll
+*.c
+ail_out*
+*.ail
+
