@@ -340,6 +340,23 @@ pub extern "C" fn ail_str_concat(a: *const u8, b: *const u8) -> *const u8 {
     Box::into_raw(boxed) as *const u8
 }
 
+// ---------- diagnostics ----------
+fn print_diag(file: &str, src: &str, line: usize, col: usize, msg: &str, hint: &str) {
+    let lines: Vec<&str> = src.split('\n').collect();
+    eprintln!();
+    eprintln!("error: {}", msg);
+    eprintln!("  --> {}:{}:{}", file, line, col);
+    if line >= 1 {
+        if let Some(&l) = lines.get(line - 1) {
+            let l = l.trim_end_matches('\r');
+            eprintln!("   |");
+            eprintln!("{:>3} | {}", line, l);
+            eprintln!("      {}^", " ".repeat(col.saturating_sub(1)));
+        }
+    }
+    if !hint.is_empty() { eprintln!("hint: {}", hint); }
+}
+
 // ---------- AST ----------
 #[derive(Debug, Clone)]
 enum Expr {
@@ -362,36 +379,62 @@ enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok { LParen, RParen, Atom(String) }
 
-fn tokenize(src: &str) -> Vec<Tok> {
+#[derive(Debug, Clone)]
+struct TokPos { t: Tok, line: usize, col: usize }
+
+/// Record the (line, col) of every byte offset so tokens can report their position.
+fn src_linecol_table(src: &str) -> Vec<(usize, usize)> {
+    let mut table = vec![(1usize, 1usize); src.len() + 1];
+    let mut bo = 0usize;
+    let (mut ln, mut cl) = (1usize, 1usize);
+    for ch in src.chars() {
+        table[bo] = (ln, cl);
+        bo += ch.len_utf8();
+        if ch == '\n' { ln += 1; cl = 1; } else { cl += 1; }
+    }
+    table[src.len()] = (ln, cl);
+    table
+}
+
+fn tokenize(src: &str, file: &str) -> Vec<TokPos> {
+    let linecol = src_linecol_table(src);
     let mut out = Vec::new();
+    let mut bo = 0usize;
     let mut chars = src.chars().peekable();
     while let Some(&c) = chars.peek() {
+        let (line, col) = linecol[bo];
         match c {
-            ' ' | '\t' | '\n' | '\r' => { chars.next(); }
-            '(' => { chars.next(); out.push(Tok::LParen); }
-            ')' => { chars.next(); out.push(Tok::RParen); }
+            ' ' | '\t' | '\n' | '\r' => { bo += c.len_utf8(); chars.next(); }
+            '(' => { bo += 1; chars.next(); out.push(TokPos { t: Tok::LParen, line, col }); }
+            ')' => { bo += 1; chars.next(); out.push(TokPos { t: Tok::RParen, line, col }); }
             '"' => {
-                chars.next();
+                let (sline, scol) = (line, col);
+                bo += 1; chars.next();
                 let mut s = String::new();
+                let mut closed = false;
                 while let Some(&ch) = chars.peek() {
-                    if ch == '"' { chars.next(); break; }
+                    if ch == '"' { bo += 1; chars.next(); closed = true; break; }
                     if ch == '\\' {
-                        chars.next();
+                        bo += 1; chars.next();
                         if let Some(&e) = chars.peek() {
-                            chars.next();
+                            bo += e.len_utf8(); chars.next();
                             match e { 'n'=>'\n', 't'=>'\t', '"' =>'"', '\\'=>'\\', _=>e }.to_string().chars().for_each(|x| s.push(x));
                         }
-                    } else { chars.next(); s.push(ch); }
+                    } else { bo += ch.len_utf8(); chars.next(); s.push(ch); }
                 }
-                out.push(Tok::Atom(format!("\"{}\"", s.replace('\\',"\\\\").replace('"',"\\\""))));
+                if !closed {
+                    print_diag(file, src, sline, scol, "unterminated string literal", "add a closing \" before the end of the line");
+                    std::process::exit(1);
+                }
+                out.push(TokPos { t: Tok::Atom(format!("\"{}\"", s.replace('\\',"\\\\").replace('"',"\\\""))), line: sline, col: scol });
             }
             _ => {
                 let mut s = String::new();
                 while let Some(&ch) = chars.peek() {
                     if ch.is_whitespace() || ch=='(' || ch==')' || ch=='"' { break; }
-                    s.push(ch); chars.next();
+                    bo += ch.len_utf8(); chars.next(); s.push(ch);
                 }
-                if !s.is_empty() { out.push(Tok::Atom(s)); }
+                if !s.is_empty() { out.push(TokPos { t: Tok::Atom(s), line, col }); }
             }
         }
     }
@@ -399,31 +442,47 @@ fn tokenize(src: &str) -> Vec<Tok> {
 }
 
 // ---------- parser ----------
-struct Parser { toks: Vec<Tok>, pos: usize }
+struct Parser { toks: Vec<TokPos>, pos: usize, file: String, src: String }
 impl Parser {
-    fn new(toks: Vec<Tok>) -> Self { Self { toks, pos: 0 } }
+    fn new(toks: Vec<TokPos>, file: String, src: String) -> Self { Self { toks, pos: 0, file, src } }
+
+    fn err(&self, msg: &str, hint: &str) -> ! {
+        let (line, col) = if self.pos < self.toks.len() {
+            (self.toks[self.pos].line, self.toks[self.pos].col)
+        } else if let Some(last) = self.toks.last() {
+            (last.line, last.col)
+        } else {
+            // empty file: report at start
+            (1, 1)
+        };
+        print_diag(&self.file, &self.src, line, col, msg, hint);
+        std::process::exit(1);
+    }
+
     fn parse_program(&mut self) -> Expr {
         let mut fns = Vec::new();
         while self.pos < self.toks.len() {
-            fns.push(self.parse_expr());
+            let e = self.parse_expr();
+            fns.push(e);
         }
         Expr::Program(fns)
     }
     fn parse_expr(&mut self) -> Expr {
-        if self.pos >= self.toks.len() { panic!("unexpected eof"); }
-        match &self.toks[self.pos] {
+        if self.pos >= self.toks.len() { self.err("unexpected end of input", "an expression is incomplete; check for missing ')'"); }
+        match &self.toks[self.pos].t {
             Tok::LParen => {
                 self.pos += 1;
-                let head = match &self.toks[self.pos] {
+                if self.pos >= self.toks.len() { self.err("unexpected end of input", "this '(' is not closed; add the matching ')'"); }
+                let head = match &self.toks[self.pos].t {
                     Tok::Atom(a) => { let a = a.clone(); self.pos += 1; a }
-                    _ => panic!("expected head atom"),
+                    _ => self.err("expected a form name after '('", "forms look like (print 1), (let x 5), (fn name () void ...)"),
                 };
                 match head.as_str() {
                     "fn" => {
                         let name = atom_str(self);
                         expect_lp(self);
                         let mut params = Vec::new();
-                        while self.pos < self.toks.len() && self.toks[self.pos] != Tok::RParen {
+                        while self.pos < self.toks.len() && self.toks[self.pos].t != Tok::RParen {
                             let pname = atom_str(self);
                             let ptype = atom_str(self);
                             params.push((pname, ptype));
@@ -431,7 +490,7 @@ impl Parser {
                         expect_rp(self);
                         let ret = atom_str(self);
                         let mut body = Vec::new();
-                        while self.pos < self.toks.len() && self.toks[self.pos] != Tok::RParen {
+                        while self.pos < self.toks.len() && self.toks[self.pos].t != Tok::RParen {
                             body.push(self.parse_expr());
                         }
                         expect_rp(self);
@@ -459,7 +518,7 @@ impl Parser {
                     "while" => {
                         let c = self.parse_expr();
                         let mut body = Vec::new();
-                        while self.pos < self.toks.len() && self.toks[self.pos] != Tok::RParen {
+                        while self.pos < self.toks.len() && self.toks[self.pos].t != Tok::RParen {
                             body.push(self.parse_expr());
                         }
                         expect_rp(self);
@@ -467,7 +526,7 @@ impl Parser {
                     }
                     "block" => {
                         let mut v = Vec::new();
-                        while self.pos < self.toks.len() && self.toks[self.pos] != Tok::RParen {
+                        while self.pos < self.toks.len() && self.toks[self.pos].t != Tok::RParen {
                             v.push(self.parse_expr());
                         }
                         expect_rp(self);
@@ -475,7 +534,7 @@ impl Parser {
                     }
                     _ => {
                         let mut args = Vec::new();
-                        while self.pos < self.toks.len() && self.toks[self.pos] != Tok::RParen {
+                        while self.pos < self.toks.len() && self.toks[self.pos].t != Tok::RParen {
                             args.push(self.parse_expr());
                         }
                         expect_rp(self);
@@ -496,23 +555,30 @@ impl Parser {
                 }
                 Expr::Var(a.clone())
             }
-            Tok::RParen => { self.pos += 1; panic!("unexpected )"); }
+            Tok::RParen => { self.pos += 1; self.err("unexpected ')'", "check for an extra ')' or a missing form before it"); }
         }
     }
 }
 
 fn atom_str(p: &mut Parser) -> String {
-    match &p.toks[p.pos] {
+    if p.pos >= p.toks.len() { p.err("unexpected end of input", "this identifier is missing; check the form syntax"); }
+    match &p.toks[p.pos].t {
         Tok::Atom(a) => { let a = a.clone(); p.pos += 1; a }
-        _ => panic!("expected atom"),
+        _ => p.err("expected an identifier here", "forms use identifiers for names, e.g. (let count 5)"),
     }
 }
 fn expect_lp(p: &mut Parser) {
-    assert!(p.toks[p.pos] == Tok::LParen, "expected (");
+    if p.pos >= p.toks.len() { p.err("unexpected end of input", "a '(' is missing here"); }
+    if p.toks[p.pos].t != Tok::LParen {
+        p.err("expected '('", "a '(' is missing here");
+    }
     p.pos += 1;
 }
 fn expect_rp(p: &mut Parser) {
-    assert!(p.toks[p.pos] == Tok::RParen, "expected )");
+    if p.pos >= p.toks.len() { p.err("unexpected end of input", "this form is not closed; add the matching ')'"); }
+    if p.toks[p.pos].t != Tok::RParen {
+        p.err("expected ')'", "a ')' is missing here; close the form");
+    }
     p.pos += 1;
 }
 
@@ -2318,8 +2384,15 @@ fn main() {
         if file.is_none() { file = Some(args[i].clone()); }
         i += 1;
     }
-    let fpath = file.unwrap_or_else(|| { eprintln!("usage: ail [--target native|wasm] <file.ail> [-o out]"); std::process::exit(1); });
-    let src = fs::read_to_string(&fpath).expect("read file");
+    let fpath = file.unwrap_or_else(|| {
+        eprintln!("usage: ail [--target native|llvm|c|wasm] <file.ail> [-o out]");
+        eprintln!("error: no input file given");
+        std::process::exit(1);
+    });
+    let src = match fs::read_to_string(&fpath) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("error: cannot read '{}': {}", fpath, e); std::process::exit(1); }
+    };
 
     // binary cache: skip recompile if cached
     let cache_dir = ail_cache_dir(&target, &src);
@@ -2329,8 +2402,8 @@ fn main() {
         std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
     }
 
-    let toks = tokenize(&src);
-    let mut parser = Parser::new(toks);
+    let toks = tokenize(&src, &fpath);
+    let mut parser = Parser::new(toks, fpath.clone(), src.clone());
     let prog = parser.parse_program();
 
     if target == "wasm" {
@@ -2365,7 +2438,16 @@ fn main() {
     cx.module.finalize_definitions().unwrap();
 
     // find main
-    let main_fid = cx.funcs.get("main").map(|x| x.0).expect("no main");
+    let main_fid = match cx.funcs.get("main") {
+        Some(x) => x.0,
+        None => {
+            eprintln!();
+            eprintln!("error: program has no 'main' function");
+            eprintln!("  --> {}", fpath);
+            eprintln!("hint: define an entry point: (fn main () void ...)");
+            std::process::exit(1);
+        }
+    };
     let code_ptr = cx.module.get_finalized_function(main_fid);
     let main_fn: extern "C" fn() = unsafe { std::mem::transmute(code_ptr) };
     main_fn();
