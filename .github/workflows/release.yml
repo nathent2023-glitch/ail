@@ -1,0 +1,17 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cd ailc && cargo build --release
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ailc-windows
+          path: ailc/target/release/ailc.exe

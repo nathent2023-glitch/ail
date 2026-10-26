@@ -1742,7 +1742,7 @@ fn compile_c(prog: &Expr) {
     cmd.arg("-fopenmp");
     let status = cmd.status();
     match status {
-        Ok(s) if s.success() => println!("built {} (gcc -O3 -march=native)", bin),
+        Ok(s) if s.success() => { println!("built {} (gcc -O3 -march=native)", bin); }
         _ => {
             let mut cmd2 = std::process::Command::new(gcc_path());
             cmd2.arg("-O3").arg("-march=native").arg("-o").arg(bin).arg(&c_path);
@@ -2144,6 +2144,35 @@ fn compile_llvm(prog: &Expr) {
     }
 }
 
+use std::hash::{Hash, Hasher};
+
+fn ail_cache_root() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".ail").join("cache")
+}
+
+fn ail_cache_dir(target: &str, src: &str) -> std::path::PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    target.hash(&mut h);
+    src.hash(&mut h);
+    let key = format!("{:x}", h.finish());
+    ail_cache_root().join(key)
+}
+
+fn cache_binary_path(cache_dir: &std::path::Path, target: &str) -> std::path::PathBuf {
+    let name = match target {
+        "wasm" => "out.wasm",
+        _ => "out.exe",
+    };
+    cache_dir.join(name)
+}
+
+fn cache_store(cache_bin: &std::path::Path, produced: &std::path::Path) {
+    if let Some(parent) = cache_bin.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _ = std::fs::copy(produced, cache_bin);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut target = "native".to_string();
@@ -2158,6 +2187,15 @@ fn main() {
     }
     let fpath = file.unwrap_or_else(|| { eprintln!("usage: ail [--target native|wasm] <file.ail> [-o out]"); std::process::exit(1); });
     let src = fs::read_to_string(&fpath).expect("read file");
+
+    // binary cache: skip recompile if cached
+    let cache_dir = ail_cache_dir(&target, &src);
+    let cache_bin = cache_binary_path(&cache_dir, &target);
+    if target != "native" && cache_bin.exists() {
+        let status = std::process::Command::new(&cache_bin).status();
+        std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
+    }
+
     let toks = tokenize(&src);
     let mut parser = Parser::new(toks);
     let prog = parser.parse_program();
@@ -2169,15 +2207,18 @@ fn main() {
         let html_path = format!("{}.html", base);
         fs::write(&wasm_path, &wasm).expect("write wasm");
         fs::write(&html_path, &html).expect("write html");
+        cache_store(&cache_bin, std::path::Path::new(&wasm_path));
         println!("built {} and {}", wasm_path, html_path);
         return;
     }
     if target == "c" {
         compile_c(&prog);
+        cache_store(&cache_bin, std::path::Path::new("ail_out.exe"));
         return;
     }
     if target == "llvm" {
         compile_llvm(&prog);
+        cache_store(&cache_bin, std::path::Path::new("ail_out.exe"));
         return;
     }
 
