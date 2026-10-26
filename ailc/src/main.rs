@@ -252,6 +252,85 @@ pub extern "C" fn ail_js_eval(_p: *const u8) -> i64 { 0 }
 pub extern "C" fn ail_dom_set_inner_html(_a: *const u8, _b: *const u8) -> i64 { 0 }
 
 #[no_mangle]
+pub extern "C" fn ail_read_file(path: *const u8) -> *const u8 {
+    if path.is_null() { return std::ptr::null(); }
+    let mut p = String::new();
+    unsafe { let mut i = 0; while *path.add(i) != 0 { p.push(*path.add(i) as char); i += 1; } }
+    match std::fs::read_to_string(&p) {
+        Ok(s) => {
+            let mut v = s.into_bytes();
+            v.push(0);
+            Box::into_raw(v.into_boxed_slice()) as *const u8
+        }
+        Err(_) => std::ptr::null(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ail_tokenize(text: *const u8) -> i64 {
+    if text.is_null() { return ail_array_new(); }
+    let mut s = String::new();
+    unsafe { let mut i = 0; while *text.add(i) != 0 { s.push(*text.add(i) as char); i += 1; } }
+    let arr = ail_array_new();
+    for tok in s.split_whitespace() {
+        let mut v = tok.as_bytes().to_vec();
+        v.push(0);
+        let ptr = Box::into_raw(v.into_boxed_slice()) as *const u8 as i64;
+        ail_array_push(arr, ptr);
+    }
+    arr
+}
+
+#[no_mangle]
+pub extern "C" fn ail_softmax(m: i64) {
+    if m <= 0 { return; }
+    let mut mats = MATS.lock().unwrap();
+    let idx = (m - 1) as usize;
+    if let Some(Some(mat)) = mats.get_mut(idx) {
+        let (rows, cols) = (mat.rows, mat.cols);
+        for r in 0..rows {
+            let mut mx = f64::NEG_INFINITY;
+            for c in 0..cols { mx = mx.max(mat.data[r*cols+c]); }
+            let mut sum = 0.0;
+            for c in 0..cols { let e = (mat.data[r*cols+c]-mx).exp(); mat.data[r*cols+c] = e; sum += e; }
+            for c in 0..cols { mat.data[r*cols+c] /= sum; }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ail_cross_entropy(pred: i64, target: i64) -> f64 {
+    if pred <= 0 || target <= 0 { return 0.0; }
+    let mats = MATS.lock().unwrap();
+    let p = match mats.get((pred-1) as usize).and_then(|m| m.as_ref()) { Some(m)=>m, None=>return 0.0 };
+    let t = match mats.get((target-1) as usize).and_then(|m| m.as_ref()) { Some(m)=>m, None=>return 0.0 };
+    if p.rows != t.rows || p.cols != t.cols { return 0.0; }
+    let n = p.rows * p.cols;
+    let mut loss = 0.0;
+    for i in 0..n {
+        let pp = p.data[i].max(1e-12);
+        loss -= t.data[i] * pp.ln();
+    }
+    loss / (p.rows as f64)
+}
+
+#[no_mangle]
+pub extern "C" fn ail_sgd_step(w: i64, g: i64, lr: f64) {
+    if w <= 0 || g <= 0 { return; }
+    let mut mats = MATS.lock().unwrap();
+    let wi = (w-1) as usize;
+    let gi = (g-1) as usize;
+    if wi >= mats.len() || gi >= mats.len() { return; }
+    if mats[wi].is_none() || mats[gi].is_none() { return; }
+    let len = mats[wi].as_ref().unwrap().data.len();
+    if len != mats[gi].as_ref().unwrap().data.len() { return; }
+    // copy grad to avoid borrow conflict
+    let grads: Vec<f64> = mats[gi].as_ref().unwrap().data.clone();
+    let ww = mats[wi].as_mut().unwrap();
+    for i in 0..len { ww.data[i] -= lr * grads[i]; }
+}
+
+#[no_mangle]
 pub extern "C" fn ail_str_concat(a: *const u8, b: *const u8) -> *const u8 {
     let mut sa = Vec::new();
     if !a.is_null() { unsafe { let mut i=0; while *a.add(i)!=0 { sa.push(*a.add(i)); i+=1; } } }
@@ -473,6 +552,9 @@ fn type_of(e: &Expr) -> String {
                 "gfx_poll" => "i64".into(),
                 "js_eval" => "i64".into(),
                 "dom_set_inner_html" => "i64".into(),
+                "read_file" => "str".into(),
+                "tokenize" => "array".into(),
+                "cross_entropy" => "f64".into(),
                 _ => "i64".into(), // user fn assumed i64 for v0
             }
         }
@@ -520,6 +602,11 @@ impl Ctx {
         builder.symbol("ail_gfx_show", ail_gfx_show as *const u8);
         builder.symbol("ail_gfx_poll", ail_gfx_poll as *const u8);
         builder.symbol("ail_gfx_close", ail_gfx_close as *const u8);
+        builder.symbol("ail_read_file", ail_read_file as *const u8);
+        builder.symbol("ail_tokenize", ail_tokenize as *const u8);
+        builder.symbol("ail_softmax", ail_softmax as *const u8);
+        builder.symbol("ail_cross_entropy", ail_cross_entropy as *const u8);
+        builder.symbol("ail_sgd_step", ail_sgd_step as *const u8);
         builder.symbol("ail_js_eval", ail_js_eval as *const u8);
         builder.symbol("ail_dom_set_inner_html", ail_dom_set_inner_html as *const u8);
         let module = JITModule::new(builder);
@@ -551,6 +638,11 @@ impl Ctx {
             ("ail_gfx_close", vec![types::I64], vec![]),
             ("ail_js_eval", vec![types::I64], vec![types::I64]),
             ("ail_dom_set_inner_html", vec![types::I64, types::I64], vec![types::I64]),
+            ("ail_read_file", vec![types::I64], vec![types::I64]),
+            ("ail_tokenize", vec![types::I64], vec![types::I64]),
+            ("ail_softmax", vec![types::I64], vec![]),
+            ("ail_cross_entropy", vec![types::I64, types::I64], vec![types::F64]),
+            ("ail_sgd_step", vec![types::I64, types::I64, types::F64], vec![]),
         ] {
             let mut sig = ctx.module.make_signature();
             for p in params { sig.params.push(AbiParam::new(p)); }
@@ -914,6 +1006,47 @@ impl Ctx {
                     let call = builder.ins().call(fref, &[sel, html]);
                     let res = builder.inst_results(call);
                     return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "read_file" && args.len() == 1 {
+                    let path = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_read_file"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[path]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "tokenize" && args.len() == 1 {
+                    let text = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_tokenize"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[text]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "softmax" && args.len() == 1 {
+                    let m = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_softmax"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &[m]);
+                    return Some(builder.ins().iconst(types::I64, 0));
+                }
+                if name == "cross_entropy" && args.len() == 2 {
+                    let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let b = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_cross_entropy"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a, b]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] });
+                }
+                if name == "sgd_step" && args.len() == 3 {
+                    let w = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let g = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let lr = self.gen_expr(builder, vars, &args[2]).unwrap_or_else(|| builder.ins().f64const(0.0));
+                    let fid = self.host["ail_sgd_step"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &[w, g, lr]);
+                    return Some(builder.ins().iconst(types::I64, 0));
                 }
                 match name.as_str() {
                     "+" | "-" | "*" | "/" | "%" => {
