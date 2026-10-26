@@ -633,6 +633,141 @@ fn cl_type(t: &str) -> Type {
     match t { "f64" => types::F64, _ => types::I64 }
 }
 
+// ---------- type checker (step 2) ----------
+struct TypeEnv<'a> {
+    file: &'a str,
+    src: &'a str,
+    fns: std::collections::HashMap<String, &'a Expr>,
+    scopes: std::collections::VecDeque<std::collections::HashMap<String, String>>,
+}
+
+impl<'a> TypeEnv<'a> {
+    fn new(file: &'a str, src: &'a str, prog: &'a Expr) -> Self {
+        let mut fns = std::collections::HashMap::new();
+        if let Expr::Program(items) = prog {
+            for item in items {
+                if let Expr::Fn { name, .. } = item { fns.insert(name.clone(), item); }
+            }
+        }
+        let mut env = TypeEnv { file, src, fns, scopes: std::collections::VecDeque::new() };
+        env.scopes.push_back(std::collections::HashMap::new());
+        env
+    }
+
+    fn error(&self, msg: &str, hint: &str) -> ! {
+        print_diag(self.file, self.src, 0, 0, msg, hint);
+        std::process::exit(1);
+    }
+
+    fn push_scope(&mut self) { self.scopes.push_back(std::collections::HashMap::new()); }
+    fn pop_scope(&mut self) { self.scopes.pop_back(); }
+    fn decl(&mut self, name: String, ty: String) { self.scopes.back_mut().unwrap().insert(name, ty); }
+    fn lookup(&self, name: &str) -> Option<String> {
+        self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
+    }
+
+    fn check(&mut self, prog: &Expr) {
+        let mut names = std::collections::HashSet::new();
+        if let Expr::Program(items) = prog {
+            for item in items {
+                if let Expr::Fn { name, .. } = item {
+                    if !names.insert(name.clone()) {
+                        self.error(&format!("duplicate function '{}'", name), "function names must be unique");
+                    }
+                }
+            }
+        }
+        if !names.contains("main") {
+            self.error("program has no entry point 'main'", "(fn main () void ...) is required");
+        }
+        if let Expr::Program(items) = prog {
+            for item in items {
+                if let Expr::Fn { name, params, ret, body } = item {
+                    self.push_scope();
+                    for (p, pt) in params { self.decl(p.clone(), pt.clone()); }
+                    for e in body { self.walk(e); }
+                    self.pop_scope();
+                }
+            }
+        }
+    }
+
+    fn walk(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Int(_) => "i64".into(),
+            Expr::Float(_) => "f64".into(),
+            Expr::Bool(_) => "i64".into(),
+            Expr::Str(_) => "str".into(),
+            Expr::Var(v) => self.lookup(v).unwrap_or_else(|| self.error(&format!("unknown variable '{}'", v), "define it with (let ...) first")),
+            Expr::Let(n, val) => { let t = self.walk(val); self.decl(n.clone(), t.clone()); t },
+            Expr::Set(n, val) => { let t = self.walk(val); if !self.scopes.iter().any(|s| s.contains_key(n)) { self.error(&format!("unknown variable '{}'", n), "define it with (let ...) first"); } self.decl(n.clone(), t.clone()); t },
+            Expr::If(c, t, e) => { let ct = self.walk(c); if ct != "i64" { self.error("if condition must be i64 (0/1)", "comparison operators return i64"); } self.walk(t) },
+            Expr::While(c, body) => { let ct = self.walk(c); if ct != "i64" { self.error("while condition must be i64 (0/1)", "comparison operators return i64"); } for b in body { self.walk(b); } "i64".into() },
+            Expr::Block(v) => v.last().map(|e| self.walk(e)).unwrap_or_else(|| "i64".into()),
+            Expr::Call(name, args) => self.check_call(name, args),
+            Expr::Fn { .. } => "fn".into(),
+            Expr::Program(_) => "void".into(),
+        }
+    }
+
+    fn check_call(&mut self, name: &str, args: &[Expr]) -> String {
+        // builtin signatures
+        let ret = match name {
+            "+" | "-" | "*" | "/" | "%" => {
+                if args.len() != 2 { self.error(&format!("'{}' expects 2 arguments, got {}", name, args.len()), ""); }
+                let a = self.walk(&args[0]);
+                let b = self.walk(&args[1]);
+                // +: both str -> str; both numeric -> i64/f64; mixed -> error
+                if a == "str" && b == "str" { "str".into() }
+                else if a != "str" && b != "str" {
+                    if a == "f64" || b == "f64" { "f64".into() } else { "i64".into() }
+                }
+                else { self.error("mixing str and numeric in arithmetic is not allowed", "use str_eq for string comparison"); "i64".into() }
+            }
+            "<" | ">" | "<=" | ">=" | "==" | "!=" | "and" | "or" => {
+                if args.len() != 2 { self.error(&format!("'{}' expects 2 arguments, got {}", name, args.len()), ""); }
+                let a = self.walk(&args[0]);
+                let b = self.walk(&args[1]);
+                if (name == "==" || name == "!=") && (a == "str" || b == "str") {
+                    self.error("== and != on str are not allowed", "use str_eq a b");
+                }
+                "i64".into()
+            }
+            "not" => { if args.len() != 1 { self.error("not expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "i64" { self.error("not expects i64", ""); } "i64".into() }
+            "print" => { if args.len() != 1 { self.error("print expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
+            "len" => { if args.len() != 1 { self.error("len expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "str" && a != "array" { self.error("len expects str or array", ""); } "i64".into() }
+            "array" => { if !args.is_empty() { self.error("array expects 0 arguments", ""); } "array".into() }
+            "push" => { if args.len() != 2 { self.error("push expects 2 arguments", ""); } let a = self.walk(&args[0]); if a != "array" { self.error("push first arg must be array", ""); } self.walk(&args[1]); "i64".into() }
+            "get" => { if args.len() != 2 { self.error("get expects 2 arguments", ""); } let a = self.walk(&args[0]); if a != "array" { self.error("get first arg must be array", ""); } self.walk(&args[1]); "i64".into() }
+            "mat_new" => { if args.len() != 2 { self.error("mat_new expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "mat".into() }
+            "mat_get" => { if args.len() != 3 { self.error("mat_get expects 3 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); self.walk(&args[2]); "f64".into() }
+            "mat_set" => { if args.len() != 4 { self.error("mat_set expects 4 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); self.walk(&args[2]); self.walk(&args[3]); "i64".into() }
+            "mat_rows" | "mat_cols" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "i64".into() }
+            "mat_add" | "mat_mul" | "mat_relu" => { if args.len() != 2 { self.error(&format!("{} expects 2 arguments", name), ""); } self.walk(&args[0]); self.walk(&args[1]); "mat".into() }
+            "gfx_open" => { if args.len() != 3 { self.error("gfx_open expects 3 arguments", ""); } for a in args { self.walk(a); } "gfx".into() }
+            "gfx_pixel" | "gfx_show" | "gfx_close" => { if args.len() != 4 { self.error(&format!("{} expects 4 arguments", name), ""); } for a in args { self.walk(a); } "i64".into() }
+            "gfx_poll" => { if args.len() != 1 { self.error("gfx_poll expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
+            "read_file" | "tokenize" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "str".into() }
+            "softmax" => { if args.len() != 1 { self.error("softmax expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
+            "cross_entropy" => { if args.len() != 2 { self.error("cross_entropy expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "f64".into() }
+            "sgd_step" => { if args.len() != 3 { self.error("sgd_step expects 3 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); self.walk(&args[2]); "i64".into() }
+            "js_eval" | "dom_set_inner_html" => { for a in args { self.walk(a); } "i64".into() }
+            _ => {
+                for a in args { self.walk(a); }
+                if let Some(f) = self.fns.get(name) {
+                    if let Expr::Fn { ref ret, .. } = **f { ret.clone() } else { "i64".into() }
+                } else { self.error(&format!("unknown function '{}'", name), "define it with (fn name ...)"); "i64".into() }
+            }
+        };
+        ret
+    }
+}
+
+fn check_prog(prog: &Expr, file: &str, src: &str) {
+    let mut env = TypeEnv::new(file, src, prog);
+    env.check(prog);
+}
+
 // ---------- compiler ----------
 struct Ctx {
     module: JITModule,
@@ -2405,6 +2540,7 @@ fn main() {
     let toks = tokenize(&src, &fpath);
     let mut parser = Parser::new(toks, fpath.clone(), src.clone());
     let prog = parser.parse_program();
+    check_prog(&prog, &fpath, &src);
 
     if target == "wasm" {
         let (wasm, html) = compile_wasm(&prog);
