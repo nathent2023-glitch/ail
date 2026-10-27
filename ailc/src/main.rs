@@ -12,6 +12,8 @@ use cranelift_module::Module as _;
 
 // ---------- host functions ----------
 #[no_mangle]
+pub extern "C" fn ail_to_f64(x: i64) -> f64 { x as f64 }
+#[no_mangle]
 pub extern "C" fn ail_print_i64(x: i64) { println!("{}", x); }
 #[no_mangle]
 pub extern "C" fn ail_print_f64(x: f64) { println!("{}", x); }
@@ -621,6 +623,8 @@ fn type_of(e: &Expr) -> String {
                 "read_file" => "str".into(),
                 "tokenize" => "array".into(),
                 "cross_entropy" => "f64".into(),
+                "to_f64" => "f64".into(),
+                "to_i64" => "i64".into(),
                 _ => "i64".into(), // user fn assumed i64 for v0
             }
         }
@@ -734,6 +738,8 @@ impl<'a> TypeEnv<'a> {
                 "i64".into()
             }
             "not" => { if args.len() != 1 { self.error("not expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "i64" { self.error("not expects i64", ""); } "i64".into() }
+            "to_f64" => { if args.len() != 1 { self.error("to_f64 expects 1 argument", ""); } self.walk(&args[0]); "f64".into() }
+            "to_i64" => { if args.len() != 1 { self.error("to_i64 expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "print" => { if args.len() != 1 { self.error("print expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "len" => { if args.len() != 1 { self.error("len expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "str" && a != "array" { self.error("len expects str or array", ""); } "i64".into() }
             "array" => { if !args.is_empty() { self.error("array expects 0 arguments", ""); } "array".into() }
@@ -804,6 +810,7 @@ impl Ctx {
         builder.symbol("ail_gfx_poll", ail_gfx_poll as *const u8);
         builder.symbol("ail_gfx_close", ail_gfx_close as *const u8);
         builder.symbol("ail_read_file", ail_read_file as *const u8);
+        builder.symbol("ail_to_f64", ail_to_f64 as *const u8);
         builder.symbol("ail_tokenize", ail_tokenize as *const u8);
         builder.symbol("ail_softmax", ail_softmax as *const u8);
         builder.symbol("ail_cross_entropy", ail_cross_entropy as *const u8);
@@ -814,6 +821,9 @@ impl Ctx {
         let mut ctx = Ctx { module, funcs: HashMap::new(), host: HashMap::new(), strs: HashMap::new(), str_counter: 0 };
         // declare host imports
         for (name, params, rets) in [
+            ("ail_to_f64", vec![types::I64], vec![types::F64]),
+            ("ail_pow_f64", vec![types::F64, types::F64], vec![types::F64]),
+            ("ail_pow_i64", vec![types::I64, types::I64], vec![types::I64]),
             ("ail_print_i64", vec![types::I64], vec![]),
             ("ail_print_f64", vec![types::F64], vec![]),
             ("ail_print_bool", vec![types::I64], vec![]),
@@ -1032,6 +1042,16 @@ impl Ctx {
                     let call = builder.ins().call(fref, &[a, b]);
                     let res = builder.inst_results(call);
                     return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "to_f64" && args.len() == 1 {
+                    if let Expr::Int(n) = &args[0] { return Some(builder.ins().f64const(*n as f64)); }
+                    let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    if type_of(&args[0]) == "f64" { return Some(a); }
+                    let fid = self.host["ail_to_f64"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] });
                 }
                 if name == "len" && !args.is_empty() {
                     let arg = args[0].clone();

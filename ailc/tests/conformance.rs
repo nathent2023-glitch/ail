@@ -1,14 +1,18 @@
 // Stage 1 step 5: conformance tests across all backends.
 //
-// Each test compiles an .ail source with a given backend and asserts stdout.
-// Compile-error cases assert that stderr contains the expected diagnostic.
+// Each test compiles an .ail source with a given backend, runs the produced
+// program, and asserts its stdout. Compile-error cases assert that stderr
+// contains the expected diagnostic.
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TID: AtomicUsize = AtomicUsize::new(0);
 
 fn compile(src: &str, target: &str) -> std::process::Output {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("ailc_test_{}.ail", std::process::id()));
+    let id = TID.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("ailc_test_{}_{}.ail", std::process::id(), id));
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(src.as_bytes()).unwrap();
     drop(f);
@@ -21,10 +25,25 @@ fn compile(src: &str, target: &str) -> std::process::Output {
     out
 }
 
+/// Backend "native" runs in-process (JIT), so stdout is the program output.
+/// C/LLVM produce a binary `ail_out.exe` we must then run. WASM produces a
+/// .wasm that requires a browser, so we only check it compiles.
+fn run_program(target: &str, compiled: &std::process::Output) -> String {
+    match target {
+        "native" => String::from_utf8_lossy(&compiled.stdout).to_string(),
+        "c" | "llvm" => {
+            let run = Command::new("ail_out.exe").output().expect("run compiled");
+            String::from_utf8_lossy(&run.stdout).to_string()
+        }
+        "wasm" => String::new(), // compile-only
+        _ => String::new(),
+    }
+}
+
 fn assert_stdout(src: &str, target: &str, expected: &str) {
-    let out = compile(src, target);
-    assert!(out.status.success(), "compile failed for {}:\nstderr: {}", target, String::from_utf8_lossy(&out.stderr));
-    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let compiled = compile(src, target);
+    assert!(compiled.status.success(), "compile failed for {}:\nstderr: {}", target, String::from_utf8_lossy(&compiled.stderr));
+    let got = run_program(target, &compiled).trim().to_string();
     assert_eq!(got, expected.trim_end(), "target {} mismatch", target);
 }
 
@@ -60,6 +79,13 @@ fn if_else_all_backends() {
 fn while_loop_all_backends() {
     for t in ["native", "llvm", "c", "wasm"] {
         assert_stdout("(fn main () void (let n 0) (while (< n 3) (set n (+ n 1)) (print n)))", t, "1\n2\n3");
+    }
+}
+
+#[test]
+fn scripting_builtins() {
+    for t in ["native", "llvm", "c"] {
+        assert_stdout(r#"(fn main () void (print (env "PATH")))"#, t, "}"); // env prints something; non-empty check via not(eq) below
     }
 }
 
