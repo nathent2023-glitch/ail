@@ -518,6 +518,265 @@ pub extern "C" fn ail_gfx_close(h: i64) {
     });
 }
 
+// ---------- extended graphics (native) ----------
+#[no_mangle]
+pub extern "C" fn ail_gfx_clear(h: i64, color: i64) {
+    if h <= 0 { return; }
+    GFXS.with(|cell| {
+        let mut gfxs = cell.borrow_mut();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get_mut(idx) {
+            for px in g.buffer.iter_mut() { *px = color as u32; }
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_rect(h: i64, x: i64, y: i64, w: i64, hh: i64, color: i64) {
+    if h <= 0 { return; }
+    GFXS.with(|cell| {
+        let mut gfxs = cell.borrow_mut();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get_mut(idx) {
+            for yy in y.max(0) as usize..(y+hh).max(0) as usize {
+                if yy >= g.h { break; }
+                for xx in x.max(0) as usize..(x+w).max(0) as usize {
+                    if xx >= g.w { break; }
+                    g.buffer[yy*g.w+xx] = color as u32;
+                }
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_line(h: i64, x1: i64, y1: i64, x2: i64, y2: i64, color: i64) {
+    if h <= 0 { return; }
+    GFXS.with(|cell| {
+        let mut gfxs = cell.borrow_mut();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get_mut(idx) {
+            let mut x = x1; let mut y = y1;
+            let dx = (x2-x1).abs(); let dy = (y2-y1).abs();
+            let sx = if x1 < x2 { 1i64 } else { -1 };
+            let sy = if y1 < y2 { 1i64 } else { -1 };
+            let mut err = dx - dy;
+            loop {
+                let xi = x as usize; let yi = y as usize;
+                if xi < g.w && yi < g.h { g.buffer[yi*g.w+xi] = color as u32; }
+                if x == x2 && y == y2 { break; }
+                let e2 = 2*err;
+                if e2 > -dy { err -= dy; x += sx; }
+                if e2 < dx { err += dx; y += sy; }
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_circle(h: i64, cx: i64, cy: i64, r: i64, color: i64) {
+    if h <= 0 { return; }
+    GFXS.with(|cell| {
+        let mut gfxs = cell.borrow_mut();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get_mut(idx) {
+            let mut x = r; let mut y = 0i64; let mut err = 0i64;
+            while x >= y {
+                for (px, py) in [(cx+x,cy+y),(cx+y,cy+x),(cx-x,cy+y),(cx-y,cy+x),(cx-x,cy-y),(cx-y,cy-x),(cx+x,cy-y),(cx+y,cy-x)] {
+                    let xi = px as usize; let yi = py as usize;
+                    if xi < g.w && yi < g.h { g.buffer[yi*g.w+xi] = color as u32; }
+                }
+                y += 1;
+                err += 1 + 2*y;
+                if 2*(err-x) + 1 > 0 { x -= 1; err += 1 - 2*x; }
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_key(h: i64, code: i64) -> i64 {
+    if h <= 0 { return 0; }
+    GFXS.with(|cell| {
+        let gfxs = cell.borrow();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get(idx) {
+            if !g.window.is_open() { return 0; }
+            let key = match code {
+                0..=9 => unsafe { std::mem::transmute::<i8, minifb::Key>(code as i8) },
+                10..=35 => unsafe { std::mem::transmute::<i8, minifb::Key>(code as i8) },
+                36 => minifb::Key::Up,
+                37 => minifb::Key::Down,
+                38 => minifb::Key::Left,
+                39 => minifb::Key::Right,
+                40 => minifb::Key::Space,
+                41 => minifb::Key::Enter,
+                42 => minifb::Key::Escape,
+                43 => minifb::Key::Backspace,
+                44 => minifb::Key::Tab,
+                _ => return 0,
+            };
+            if g.window.is_key_down(key) { 1 } else { 0 }
+        } else { 0 }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_mouse_x(h: i64) -> i64 {
+    if h <= 0 { return 0; }
+    GFXS.with(|cell| {
+        let gfxs = cell.borrow();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get(idx) {
+            if let Some((x, _)) = g.window.get_mouse_pos(minifb::MouseMode::Clamp) { x as i64 } else { 0 }
+        } else { 0 }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_mouse_y(h: i64) -> i64 {
+    if h <= 0 { return 0; }
+    GFXS.with(|cell| {
+        let gfxs = cell.borrow();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get(idx) {
+            if let Some((_, y)) = g.window.get_mouse_pos(minifb::MouseMode::Clamp) { y as i64 } else { 0 }
+        } else { 0 }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_width(h: i64) -> i64 {
+    if h <= 0 { return 0; }
+    GFXS.with(|cell| {
+        let gfxs = cell.borrow();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get(idx) { g.w as i64 } else { 0 }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_height(h: i64) -> i64 {
+    if h <= 0 { return 0; }
+    GFXS.with(|cell| {
+        let gfxs = cell.borrow();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get(idx) { g.h as i64 } else { 0 }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ail_gfx_fps(h: i64, fps: i64) {
+    if h <= 0 { return; }
+    GFXS.with(|cell| {
+        let mut gfxs = cell.borrow_mut();
+        let idx = (h-1) as usize;
+        if let Some(Some(g)) = gfxs.get_mut(idx) {
+            g.window.set_target_fps(fps.max(1) as usize);
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn ail_rgb(r: i64, g: i64, b: i64) -> i64 {
+    ((r.clamp(0,255) as u32) << 16 | (g.clamp(0,255) as u32) << 8 | (b.clamp(0,255) as u32)) as i64
+}
+
+// ---------- extended matrices ----------
+#[no_mangle]
+pub extern "C" fn ail_mat_transpose(h: i64) -> i64 {
+    if h <= 0 { return 0; }
+    // reuse MATS registry
+    use std::sync::Mutex as M;
+    // MATS is LazyLock<Mutex<Vec<Option<Mat>>>>; access via the global
+    // We'll implement inline using the existing MATS static
+    let mut mats = MATS.lock().unwrap();
+    let idx = (h-1) as usize;
+    if idx >= mats.len() { return 0; }
+    if let Some(Some(m)) = mats.get(idx) {
+        let (r, c) = (m.rows, m.cols);
+        let mut data = vec![0.0f64; r*c];
+        for i in 0..r { for j in 0..c { data[j*r+i] = m.data[i*c+j]; } }
+        let nm = Mat { rows: c, cols: r, data };
+        mats.push(Some(nm));
+        mats.len() as i64
+    } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn ail_mat_scale(h: i64, s: f64) -> i64 {
+    if h <= 0 { return 0; }
+    let mut mats = MATS.lock().unwrap();
+    let idx = (h-1) as usize;
+    if idx >= mats.len() { return 0; }
+    if let Some(Some(m)) = mats.get(idx) {
+        let mut data = m.data.clone();
+        for v in data.iter_mut() { *v *= s; }
+        let nm = Mat { rows: m.rows, cols: m.cols, data };
+        mats.push(Some(nm));
+        mats.len() as i64
+    } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn ail_mat_sub(a: i64, b: i64) -> i64 {
+    if a <= 0 || b <= 0 { return 0; }
+    let mut mats = MATS.lock().unwrap();
+    let (ia, ib) = ((a-1) as usize, (b-1) as usize);
+    if ia >= mats.len() || ib >= mats.len() { return 0; }
+    let (ra, ca, dataa) = if let Some(Some(m)) = mats.get(ia) { (m.rows, m.cols, m.data.clone()) } else { return 0; };
+    let (rb, cb, datab) = if let Some(Some(m)) = mats.get(ib) { (m.rows, m.cols, m.data.clone()) } else { return 0; };
+    if ra != rb || ca != cb { return 0; }
+    let data: Vec<f64> = dataa.iter().zip(datab.iter()).map(|(x,y)| x-y).collect();
+    let nm = Mat { rows: ra, cols: ca, data };
+    mats.push(Some(nm));
+    mats.len() as i64
+}
+
+#[no_mangle]
+pub extern "C" fn ail_mat_identity(n: i64) -> i64 {
+    let n = n.max(1) as usize;
+    let mut data = vec![0.0f64; n*n];
+    for i in 0..n { data[i*n+i] = 1.0; }
+    let nm = Mat { rows: n, cols: n, data };
+    let mut mats = MATS.lock().unwrap();
+    mats.push(Some(nm));
+    mats.len() as i64
+}
+
+#[no_mangle]
+pub extern "C" fn ail_mat_sum(h: i64) -> f64 {
+    if h <= 0 { return 0.0; }
+    let mats = MATS.lock().unwrap();
+    let idx = (h-1) as usize;
+    if idx >= mats.len() { return 0.0; }
+    if let Some(Some(m)) = mats.get(idx) { m.data.iter().sum() } else { 0.0 }
+}
+
+#[no_mangle]
+pub extern "C" fn ail_mat_copy(h: i64) -> i64 {
+    if h <= 0 { return 0; }
+    let mut mats = MATS.lock().unwrap();
+    let idx = (h-1) as usize;
+    if idx >= mats.len() { return 0; }
+    if let Some(Some(m)) = mats.get(idx) {
+        let nm = Mat { rows: m.rows, cols: m.cols, data: m.data.clone() };
+        mats.push(Some(nm));
+        mats.len() as i64
+    } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn ail_mat_fill(h: i64, val: f64) {
+    if h <= 0 { return; }
+    let mut mats = MATS.lock().unwrap();
+    let idx = (h-1) as usize;
+    if idx >= mats.len() { return; }
+    if let Some(Some(m)) = mats.get_mut(idx) {
+        for v in m.data.iter_mut() { *v = val; }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn ail_js_eval(_p: *const u8) -> i64 { 0 }
 
@@ -896,6 +1155,12 @@ fn type_of(e: &Expr) -> String {
                 "mat_relu" => "mat".into(),
                 "gfx_open" => "gfx".into(),
                 "gfx_poll" => "i64".into(),
+                "gfx_clear" | "gfx_rect" | "gfx_line" | "gfx_circle" | "gfx_fps" => "i64".into(),
+                "gfx_key" => "i64".into(),
+                "gfx_mouse_x" | "gfx_mouse_y" | "gfx_width" | "gfx_height" => "i64".into(),
+                "rgb" => "i64".into(),
+                "mat_transpose" | "mat_scale" | "mat_sub" | "mat_identity" | "mat_copy" | "mat_fill" => "mat".into(),
+                "mat_sum" => "f64".into(),
                 "js_eval" => "i64".into(),
                 "dom_set_inner_html" => "i64".into(),
                 "read_file" => "str".into(),
@@ -1066,8 +1331,24 @@ impl<'a> TypeEnv<'a> {
             "mat_rows" | "mat_cols" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "i64".into() }
             "mat_add" | "mat_mul" | "mat_relu" => { if args.len() != 2 { self.error(&format!("{} expects 2 arguments", name), ""); } self.walk(&args[0]); self.walk(&args[1]); "mat".into() }
             "gfx_open" => { if args.len() != 3 { self.error("gfx_open expects 3 arguments", ""); } for a in args { self.walk(a); } "gfx".into() }
-            "gfx_pixel" | "gfx_show" | "gfx_close" => { if args.len() != 4 { self.error(&format!("{} expects 4 arguments", name), ""); } for a in args { self.walk(a); } "i64".into() }
+            "gfx_pixel" => { if args.len() != 4 { self.error("gfx_pixel expects 4 arguments", ""); } for a in args { self.walk(a); } "i64".into() }
+            "gfx_show" => { if args.len() != 1 { self.error("gfx_show expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
+            "gfx_close" => { if args.len() != 1 { self.error("gfx_close expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "gfx_poll" => { if args.len() != 1 { self.error("gfx_poll expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
+            "gfx_clear" => { if args.len() != 2 { self.error("gfx_clear expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "i64".into() }
+            "gfx_rect" => { if args.len() != 6 { self.error("gfx_rect expects 6 arguments", ""); } for a in args { self.walk(a); } "i64".into() }
+            "gfx_line" => { if args.len() != 6 { self.error("gfx_line expects 6 arguments", ""); } for a in args { self.walk(a); } "i64".into() }
+            "gfx_circle" => { if args.len() != 5 { self.error("gfx_circle expects 5 arguments", ""); } for a in args { self.walk(a); } "i64".into() }
+            "gfx_key" => { if args.len() != 2 { self.error("gfx_key expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "i64".into() }
+            "gfx_mouse_x" | "gfx_mouse_y" | "gfx_width" | "gfx_height" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "i64".into() }
+            "gfx_fps" => { if args.len() != 2 { self.error("gfx_fps expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "i64".into() }
+            "rgb" => { if args.len() != 3 { self.error("rgb expects 3 arguments", ""); } for a in args { self.walk(a); } "i64".into() }
+            "mat_transpose" | "mat_copy" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "mat".into() }
+            "mat_scale" => { if args.len() != 2 { self.error("mat_scale expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "mat".into() }
+            "mat_sub" => { if args.len() != 2 { self.error("mat_sub expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "mat".into() }
+            "mat_identity" => { if args.len() != 1 { self.error("mat_identity expects 1 argument", ""); } self.walk(&args[0]); "mat".into() }
+            "mat_sum" => { if args.len() != 1 { self.error("mat_sum expects 1 argument", ""); } self.walk(&args[0]); "f64".into() }
+            "mat_fill" => { if args.len() != 2 { self.error("mat_fill expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "i64".into() }
             "read_file" | "tokenize" | "env" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "str".into() }
             "to_str" => { if args.len() != 1 { self.error("to_str expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "i64" && a != "f64" { self.error("to_str expects i64 or f64", ""); } "str".into() }
             "sqrt" | "exp" | "ln" | "floor" | "ceil" | "round" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "f64".into() }
@@ -1159,6 +1440,24 @@ impl Ctx {
         builder.symbol("ail_gfx_show", ail_gfx_show as *const u8);
         builder.symbol("ail_gfx_poll", ail_gfx_poll as *const u8);
         builder.symbol("ail_gfx_close", ail_gfx_close as *const u8);
+        builder.symbol("ail_gfx_clear", ail_gfx_clear as *const u8);
+        builder.symbol("ail_gfx_rect", ail_gfx_rect as *const u8);
+        builder.symbol("ail_gfx_line", ail_gfx_line as *const u8);
+        builder.symbol("ail_gfx_circle", ail_gfx_circle as *const u8);
+        builder.symbol("ail_gfx_key", ail_gfx_key as *const u8);
+        builder.symbol("ail_gfx_mouse_x", ail_gfx_mouse_x as *const u8);
+        builder.symbol("ail_gfx_mouse_y", ail_gfx_mouse_y as *const u8);
+        builder.symbol("ail_gfx_width", ail_gfx_width as *const u8);
+        builder.symbol("ail_gfx_height", ail_gfx_height as *const u8);
+        builder.symbol("ail_gfx_fps", ail_gfx_fps as *const u8);
+        builder.symbol("ail_rgb", ail_rgb as *const u8);
+        builder.symbol("ail_mat_transpose", ail_mat_transpose as *const u8);
+        builder.symbol("ail_mat_scale", ail_mat_scale as *const u8);
+        builder.symbol("ail_mat_sub", ail_mat_sub as *const u8);
+        builder.symbol("ail_mat_identity", ail_mat_identity as *const u8);
+        builder.symbol("ail_mat_sum", ail_mat_sum as *const u8);
+        builder.symbol("ail_mat_copy", ail_mat_copy as *const u8);
+        builder.symbol("ail_mat_fill", ail_mat_fill as *const u8);
         builder.symbol("ail_read_file", ail_read_file as *const u8);
         builder.symbol("ail_to_f64", ail_to_f64 as *const u8);
         builder.symbol("ail_to_i64", ail_to_i64 as *const u8);
@@ -1216,6 +1515,24 @@ impl Ctx {
             ("ail_gfx_show", vec![types::I64], vec![]),
             ("ail_gfx_poll", vec![types::I64], vec![types::I64]),
             ("ail_gfx_close", vec![types::I64], vec![]),
+            ("ail_gfx_clear", vec![types::I64, types::I64], vec![]),
+            ("ail_gfx_rect", vec![types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], vec![]),
+            ("ail_gfx_line", vec![types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], vec![]),
+            ("ail_gfx_circle", vec![types::I64, types::I64, types::I64, types::I64, types::I64], vec![]),
+            ("ail_gfx_key", vec![types::I64, types::I64], vec![types::I64]),
+            ("ail_gfx_mouse_x", vec![types::I64], vec![types::I64]),
+            ("ail_gfx_mouse_y", vec![types::I64], vec![types::I64]),
+            ("ail_gfx_width", vec![types::I64], vec![types::I64]),
+            ("ail_gfx_height", vec![types::I64], vec![types::I64]),
+            ("ail_gfx_fps", vec![types::I64, types::I64], vec![]),
+            ("ail_rgb", vec![types::I64, types::I64, types::I64], vec![types::I64]),
+            ("ail_mat_transpose", vec![types::I64], vec![types::I64]),
+            ("ail_mat_scale", vec![types::I64, types::F64], vec![types::I64]),
+            ("ail_mat_sub", vec![types::I64, types::I64], vec![types::I64]),
+            ("ail_mat_identity", vec![types::I64], vec![types::I64]),
+            ("ail_mat_sum", vec![types::I64], vec![types::F64]),
+            ("ail_mat_copy", vec![types::I64], vec![types::I64]),
+            ("ail_mat_fill", vec![types::I64, types::F64], vec![]),
             ("ail_js_eval", vec![types::I64], vec![types::I64]),
             ("ail_dom_set_inner_html", vec![types::I64, types::I64], vec![types::I64]),
             ("ail_env_str", vec![types::I64], vec![types::I64]),
@@ -1677,6 +1994,120 @@ impl Ctx {
                     let fref = self.module.declare_func_in_func(fid, builder.func);
                     builder.ins().call(fref, &[h]);
                     return Some(builder.ins().iconst(types::I64, 0));
+                }
+                // extended graphics
+                if name == "gfx_clear" && args.len() == 2 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let c = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_gfx_clear"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &[h, c]); return Some(builder.ins().iconst(types::I64, 0));
+                }
+                if name == "gfx_rect" && args.len() == 6 {
+                    let mut v = Vec::new();
+                    for a in args { v.push(self.gen_expr(builder, vars, a).unwrap_or_else(|| builder.ins().iconst(types::I64, 0))); }
+                    let fid = self.host["ail_gfx_rect"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &v); return Some(builder.ins().iconst(types::I64, 0));
+                }
+                if name == "gfx_line" && args.len() == 6 {
+                    let mut v = Vec::new();
+                    for a in args { v.push(self.gen_expr(builder, vars, a).unwrap_or_else(|| builder.ins().iconst(types::I64, 0))); }
+                    let fid = self.host["ail_gfx_line"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &v); return Some(builder.ins().iconst(types::I64, 0));
+                }
+                if name == "gfx_circle" && args.len() == 5 {
+                    let mut v = Vec::new();
+                    for a in args { v.push(self.gen_expr(builder, vars, a).unwrap_or_else(|| builder.ins().iconst(types::I64, 0))); }
+                    let fid = self.host["ail_gfx_circle"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &v); return Some(builder.ins().iconst(types::I64, 0));
+                }
+                if name == "gfx_key" && args.len() == 2 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let c = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_gfx_key"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h, c]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "gfx_mouse_x" && args.len() == 1 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_gfx_mouse_x"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "gfx_mouse_y" && args.len() == 1 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_gfx_mouse_y"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "gfx_width" && args.len() == 1 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_gfx_width"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "gfx_height" && args.len() == 1 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_gfx_height"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "gfx_fps" && args.len() == 2 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let f = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_gfx_fps"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &[h, f]); return Some(builder.ins().iconst(types::I64, 0));
+                }
+                if name == "rgb" && args.len() == 3 {
+                    let mut v = Vec::new();
+                    for a in args { v.push(self.gen_expr(builder, vars, a).unwrap_or_else(|| builder.ins().iconst(types::I64, 0))); }
+                    let fid = self.host["ail_rgb"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &v); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                // extended matrices
+                if name == "mat_transpose" && args.len() == 1 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_mat_transpose"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "mat_scale" && args.len() == 2 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let s = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().f64const(0.0));
+                    let fid = self.host["ail_mat_scale"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h, s]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "mat_sub" && args.len() == 2 {
+                    let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let b = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_mat_sub"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a, b]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "mat_identity" && args.len() == 1 {
+                    let n = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_mat_identity"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[n]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "mat_sum" && args.len() == 1 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_mat_sum"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] });
+                }
+                if name == "mat_copy" && args.len() == 1 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_mat_copy"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[h]); let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "mat_fill" && args.len() == 2 {
+                    let h = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let v = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().f64const(0.0));
+                    let fid = self.host["ail_mat_fill"]; let fref = self.module.declare_func_in_func(fid, builder.func);
+                    builder.ins().call(fref, &[h, v]); return Some(builder.ins().iconst(types::I64, 0));
                 }
                 if name == "get" && args.len() == 2 {
                     let arr = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
@@ -2492,6 +2923,13 @@ fn gen_c_expr(e: &Expr) -> String {
                 "mat_add" => { if args.len() >= 2 { format!("ail_mat_add({}, {})", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0".into() } }
                 "mat_mul" => { if args.len() >= 2 { format!("ail_mat_mul({}, {})", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0".into() } }
                 "mat_relu" => { if !args.is_empty() { format!("ail_mat_relu({})", gen_c_expr(&args[0])) } else { "0".into() } }
+                "mat_transpose" => { if !args.is_empty() { format!("ail_mat_transpose({})", gen_c_expr(&args[0])) } else { "0".into() } }
+                "mat_scale" => { if args.len() >= 2 { format!("ail_mat_scale({}, (double)({}))", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0".into() } }
+                "mat_sub" => { if args.len() >= 2 { format!("ail_mat_sub({}, {})", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0".into() } }
+                "mat_identity" => { if !args.is_empty() { format!("ail_mat_identity({})", gen_c_expr(&args[0])) } else { "0".into() } }
+                "mat_sum" => { if !args.is_empty() { format!("ail_mat_sum({})", gen_c_expr(&args[0])) } else { "0.0".into() } }
+                "mat_copy" => { if !args.is_empty() { format!("ail_mat_copy({})", gen_c_expr(&args[0])) } else { "0".into() } }
+                "mat_fill" => { if args.len() >= 2 { format!("(ail_mat_fill({}, (double)({})), 0)", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0".into() } }
                 "env" => { if !args.is_empty() { format!("getenv({})", gen_c_expr(&args[0])) } else { "NULL".into() } }
                 "to_f64" => { if !args.is_empty() { format!("(double)({})", gen_c_expr(&args[0])) } else { "0.0".into() } }
                 "to_i64" => { if !args.is_empty() { format!("(long long)({})", gen_c_expr(&args[0])) } else { "0".into() } }
@@ -2611,6 +3049,13 @@ fn compile_c(prog: &Expr) {
     code.push_str("Mat* ail_mat_add(Mat* a,Mat* b){ if(a->rows!=b->rows||a->cols!=b->cols) return NULL; Mat* r=ail_mat_new(a->rows,a->cols); for(long long i=0;i<a->rows*a->cols;i++) r->data[i]=a->data[i]+b->data[i]; return r; }\n");
     code.push_str("Mat* ail_mat_mul(Mat* a,Mat* b){ if(a->cols!=b->rows) return NULL; Mat* r=ail_mat_new(a->rows,b->cols); for(long long i=0;i<a->rows;i++) for(long long j=0;j<b->cols;j++){ double s=0; for(long long k=0;k<a->cols;k++) s+=a->data[i*a->cols+k]*b->data[k*b->cols+j]; r->data[i*r->cols+j]=s; } return r; }\n");
     code.push_str("Mat* ail_mat_relu(Mat* m){ for(long long i=0;i<m->rows*m->cols;i++) if(m->data[i]<0) m->data[i]=0; return m; }\n\n");
+    code.push_str("Mat* ail_mat_transpose(Mat* m){ long long r=m->rows,c=m->cols; Mat* n=ail_mat_new(c,r); for(long long i=0;i<r;i++) for(long long j=0;j<c;j++) n->data[j*r+i]=m->data[i*c+j]; return n; }\n");
+    code.push_str("Mat* ail_mat_scale(Mat* m,double s){ Mat* n=ail_mat_new(m->rows,m->cols); for(long long i=0;i<m->rows*m->cols;i++) n->data[i]=m->data[i]*s; return n; }\n");
+    code.push_str("Mat* ail_mat_sub(Mat* a,Mat* b){ if(a->rows!=b->rows||a->cols!=b->cols) return ail_mat_new(a->rows,a->cols); Mat* n=ail_mat_new(a->rows,a->cols); for(long long i=0;i<a->rows*a->cols;i++) n->data[i]=a->data[i]-b->data[i]; return n; }\n");
+    code.push_str("Mat* ail_mat_identity(long long n){ Mat* m=ail_mat_new(n,n); for(long long i=0;i<n;i++) m->data[i*n+i]=1.0; return m; }\n");
+    code.push_str("double ail_mat_sum(Mat* m){ double s=0; for(long long i=0;i<m->rows*m->cols;i++) s+=m->data[i]; return s; }\n");
+    code.push_str("Mat* ail_mat_copy(Mat* m){ Mat* n=ail_mat_new(m->rows,m->cols); for(long long i=0;i<m->rows*m->cols;i++) n->data[i]=m->data[i]; return n; }\n");
+    code.push_str("void ail_mat_fill(Mat* m,double v){ for(long long i=0;i<m->rows*m->cols;i++) m->data[i]=v; }\n");
 
     // forward decls
     for f in &fns {

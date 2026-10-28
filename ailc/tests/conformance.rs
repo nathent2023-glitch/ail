@@ -209,6 +209,15 @@ fn math_all_backends() {
 }
 
 #[test]
+fn matrix_native() {
+    assert_stdout(
+        "(fn main () void (let a (mat_new 2 3)) (mat_set a 0 0 1.0) (mat_set a 0 1 2.0) (mat_set a 0 2 3.0) (mat_set a 1 0 4.0) (mat_set a 1 1 5.0) (mat_set a 1 2 6.0) (let b (mat_transpose a)) (print (mat_rows b)) (print (mat_cols b)) (print (mat_get b 0 1)) (let c (mat_identity 3)) (print (mat_get c 1 1)) (print (mat_sum a)))",
+        "native",
+        "3\n2\n4\n1\n21",
+    );
+}
+
+#[test]
 fn sum_native_and_c() {
     for t in ["native", "c"] {
         assert_stdout(
