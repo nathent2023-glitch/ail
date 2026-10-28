@@ -99,6 +99,39 @@ fn scripting_builtins() {
 }
 
 #[test]
+fn user_fn_types_all_backends() {
+    for t in ["native", "llvm", "c", "wasm"] {
+        // f64 param/return must flow through every backend (declared types, not "i64" default)
+        assert_stdout("(fn half (x f64) f64 (* x 0.5)) (fn main () void (print (half 4.0)))", t, "2");
+    }
+    for t in ["native", "llvm", "c", "wasm"] {
+        let (out, _dir) = compile("(fn half (x f64) f64 (* x 0.5)) (fn main () void (print (half 4)))", t);
+        assert!(!out.status.success(), "expected failure for {}", t);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("expects f64"), "stderr missing param type error: {}", stderr);
+    }
+}
+
+#[test]
+fn recursion_all_backends() {
+    for t in ["native", "llvm", "c", "wasm"] {
+        assert_stdout("(fn fact (n i64) i64 (if (< n 2) 1 (* n (fact (- n 1))))) (fn main () void (print (fact 5)))", t, "120");
+    }
+}
+
+#[test]
+fn to_str_all_backends() {
+    for t in ["native", "llvm", "c", "wasm"] {
+        assert_stdout("(fn main () void (print (to_str 42)))", t, "42");
+        assert_stdout("(fn main () void (print (to_str 2.5)))", t, "2.5");
+    }
+    // concatenating a formatted number into a message (str concat: native + C)
+    for t in ["native", "c", "wasm"] {
+        assert_stdout(r#"(fn main () void (print (+ "n=" (to_str 7))))"#, t, "n=7");
+    }
+}
+
+#[test]
 fn compile_error_missing_main() {
     for t in ["native", "llvm", "c", "wasm"] {
         let (out, _dir) = compile("(fn foo () void (print 1))", t);

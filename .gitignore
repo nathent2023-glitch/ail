@@ -7,4 +7,5 @@ target/
 *.c
 ail_out*
 *.ail
+!ailc/tests/*.ail
 

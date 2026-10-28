@@ -19,6 +19,19 @@ pub extern "C" fn ail_to_f64(x: i64) -> f64 { x as f64 }
 use std::ffi::{CStr, CString};
 use std::sync::LazyLock;
 static ENV_CACHE: LazyLock<std::sync::Mutex<HashMap<String, CString>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+// declared user-fn (param types, return type), filled by the checker before codegen
+static FN_TYPES: LazyLock<std::sync::Mutex<HashMap<String, (Vec<String>, String)>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+// Returned string is process-lifetime (leaked); safe for str_concat composition
+#[no_mangle]
+pub extern "C" fn ail_to_str_i64(x: i64) -> *const u8 {
+    let c = CString::new(format!("{}", x)).unwrap();
+    Box::leak(c.into_boxed_c_str()).as_ptr() as *const u8
+}
+#[no_mangle]
+pub extern "C" fn ail_to_str_f64(x: f64) -> *const u8 {
+    let c = CString::new(format!("{}", x)).unwrap();
+    Box::leak(c.into_boxed_c_str()).as_ptr() as *const u8
+}
 #[no_mangle]
 pub extern "C" fn ail_env_str(key: *const u8) -> *const u8 {
     if key.is_null() { return std::ptr::null(); }
@@ -640,11 +653,12 @@ fn type_of(e: &Expr) -> String {
                 "dom_set_inner_html" => "i64".into(),
                 "read_file" => "str".into(),
                 "env" => "str".into(),
+                "to_str" => "str".into(),
                 "tokenize" => "array".into(),
                 "cross_entropy" => "f64".into(),
                 "to_f64" => "f64".into(),
                 "to_i64" => "i64".into(),
-                _ => "i64".into(), // user fn assumed i64 for v0
+                _ => FN_TYPES.lock().unwrap().get(name).cloned().map(|(_, r)| r).unwrap_or_else(|| "i64".into()),
             }
         }
         Expr::Fn { ret, .. } => ret.clone(),
@@ -706,6 +720,7 @@ impl<'a> TypeEnv<'a> {
         if let Expr::Program(items) = prog {
             for item in items {
                 if let Expr::Fn { name, params, ret, body } = item {
+                    FN_TYPES.lock().unwrap().insert(name.clone(), (params.iter().map(|(_, t)| t.clone()).collect(), ret.clone()));
                     self.push_scope();
                     for (p, pt) in params { self.decl(p.clone(), pt.clone()); }
                     for e in body { self.walk(e); }
@@ -773,14 +788,25 @@ impl<'a> TypeEnv<'a> {
             "gfx_pixel" | "gfx_show" | "gfx_close" => { if args.len() != 4 { self.error(&format!("{} expects 4 arguments", name), ""); } for a in args { self.walk(a); } "i64".into() }
             "gfx_poll" => { if args.len() != 1 { self.error("gfx_poll expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "read_file" | "tokenize" | "env" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "str".into() }
+            "to_str" => { if args.len() != 1 { self.error("to_str expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "i64" && a != "f64" { self.error("to_str expects i64 or f64", ""); } "str".into() }
             "softmax" => { if args.len() != 1 { self.error("softmax expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "cross_entropy" => { if args.len() != 2 { self.error("cross_entropy expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "f64".into() }
             "sgd_step" => { if args.len() != 3 { self.error("sgd_step expects 3 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); self.walk(&args[2]); "i64".into() }
             "js_eval" | "dom_set_inner_html" => { for a in args { self.walk(a); } "i64".into() }
             _ => {
-                for a in args { self.walk(a); }
                 if let Some(f) = self.fns.get(name) {
-                    if let Expr::Fn { ref ret, .. } = **f { ret.clone() } else { "i64".into() }
+                    if let Expr::Fn { ref params, ref ret, .. } = **f {
+                        if params.len() != args.len() {
+                            self.error(&format!("'{}' expects {} arguments, got {}", name, params.len(), args.len()), "");
+                        }
+                        for ((pn, pt), a) in params.iter().zip(args.iter()) {
+                            let av = self.walk(a);
+                            if av != *pt {
+                                self.error(&format!("'{}' param '{}' expects {}, got {}", name, pn, pt, av), "");
+                            }
+                        }
+                        ret.clone()
+                    } else { "i64".into() }
                 } else { self.error(&format!("unknown function '{}'", name), "define it with (fn name ...)"); "i64".into() }
             }
         };
@@ -831,6 +857,8 @@ impl Ctx {
         builder.symbol("ail_read_file", ail_read_file as *const u8);
         builder.symbol("ail_to_f64", ail_to_f64 as *const u8);
         builder.symbol("ail_to_i64", ail_to_i64 as *const u8);
+        builder.symbol("ail_to_str_i64", ail_to_str_i64 as *const u8);
+        builder.symbol("ail_to_str_f64", ail_to_str_f64 as *const u8);
         builder.symbol("ail_env_str", ail_env_str as *const u8);
         builder.symbol("ail_tokenize", ail_tokenize as *const u8);
         builder.symbol("ail_softmax", ail_softmax as *const u8);
@@ -844,6 +872,8 @@ impl Ctx {
         for (name, params, rets) in [
             ("ail_to_f64", vec![types::I64], vec![types::F64]),
             ("ail_to_i64", vec![types::F64], vec![types::I64]),
+            ("ail_to_str_i64", vec![types::I64], vec![types::I64]),
+            ("ail_to_str_f64", vec![types::F64], vec![types::I64]),
             ("ail_pow_f64", vec![types::F64, types::F64], vec![types::F64]),
             ("ail_pow_i64", vec![types::I64, types::I64], vec![types::I64]),
             ("ail_print_i64", vec![types::I64], vec![]),
@@ -1082,6 +1112,14 @@ impl Ctx {
                     let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
                     if type_of(&args[0]) == "i64" { return Some(a); }
                     let fid = self.host["ail_to_i64"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "to_str" && args.len() == 1 {
+                    let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host[if type_of(&args[0]) == "f64" { "ail_to_str_f64" } else { "ail_to_str_i64" }];
                     let fref = self.module.declare_func_in_func(fid, builder.func);
                     let call = builder.ins().call(fref, &[a]);
                     let res = builder.inst_results(call);
@@ -2008,6 +2046,12 @@ fn gen_c_expr(e: &Expr) -> String {
                 "env" => { if !args.is_empty() { format!("getenv({})", gen_c_expr(&args[0])) } else { "NULL".into() } }
                 "to_f64" => { if !args.is_empty() { format!("(double)({})", gen_c_expr(&args[0])) } else { "0.0".into() } }
                 "to_i64" => { if !args.is_empty() { format!("(long long)({})", gen_c_expr(&args[0])) } else { "0".into() } }
+                "to_str" => {
+                    if !args.is_empty() {
+                        let v = gen_c_expr(&args[0]);
+                        if type_of(&args[0]) == "f64" { format!("ail_to_str_f64({})", v) } else { format!("ail_to_str_i64({})", v) }
+                    } else { "NULL".into() }
+                }
                 _ => {
                     // user function call
                     let a: Vec<String> = args.iter().map(gen_c_expr).collect();
@@ -2073,6 +2117,8 @@ fn compile_c(prog: &Expr) {
     code.push_str("void ail_print_bool(int x){ printf(\"%s\\n\", x?\"true\":\"false\"); }\n");
     code.push_str("long long ail_str_len(const char* s){ return (long long)strlen(s); }\n");
     code.push_str("char* ail_str_concat(const char* a, const char* b){ size_t la=strlen(a), lb=strlen(b); char* r=malloc(la+lb+1); memcpy(r,a,la); memcpy(r+la,b,lb); r[la+lb]=0; return r; }\n");
+    code.push_str("char* ail_to_str_i64(long long x){ char t[32]; snprintf(t,32,\"%lld\",x); char* r=malloc(strlen(t)+1); strcpy(r,t); return r; }\n");
+    code.push_str("char* ail_to_str_f64(double x){ char t[64]; snprintf(t,64,\"%g\",x); char* r=malloc(strlen(t)+1); strcpy(r,t); return r; }\n");
 
     // array helpers
     code.push_str("Arr* ail_array_new(){ Arr* a=malloc(sizeof(Arr)); a->len=0; a->cap=8; a->data=malloc(8*sizeof(long long)); return a; }\n");
@@ -2347,6 +2393,19 @@ fn gen_llvm_expr(e: &Expr, ctx: &mut LlvmCtx, code: &mut String) -> String {
                         } else { a }
                     } else { "0".into() }
                 }
+                "to_str" => {
+                    if !args.is_empty() {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        let buf = ctx.temp();
+                        code.push_str(&format!("  {} = call i8* @malloc(i64 32)\n", buf));
+                        if type_of(&args[0]) == "f64" {
+                            code.push_str(&format!("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* {}, i64 32, i8* getelementptr inbounds ([3 x i8], ptr @fmt_tstr_f64, i64 0, i64 0), double {})\n", buf, a));
+                        } else {
+                            code.push_str(&format!("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* {}, i64 32, i8* getelementptr inbounds ([5 x i8], ptr @fmt_tstr_i64, i64 0, i64 0), i64 {})\n", buf, a));
+                        }
+                        buf
+                    } else { "0".into() }
+                }
                 _ => {
                     // user function or unknown
                     let a: Vec<String> = args.iter().map(|x| {
@@ -2354,10 +2413,15 @@ fn gen_llvm_expr(e: &Expr, ctx: &mut LlvmCtx, code: &mut String) -> String {
                         let t = llvm_type(&type_of(x));
                         format!("{} {}", t, v)
                     }).collect();
-                    let v = ctx.temp();
                     let argstr = a.join(", ");
-                    let rt = "i64";
-                    code.push_str(&format!("  {} = call {} @{}({})\n", v, rt, name, argstr));
+                    let ret_t = FN_TYPES.lock().unwrap().get(name).cloned().map(|(_, r)| r).unwrap_or_else(|| "i64".into());
+                    let v = ctx.temp();
+                    if ret_t == "void" {
+                        code.push_str(&format!("  call void @{}({})\n", name, argstr));
+                        code.push_str(&format!("  {} = add i64 0, 0\n", v));
+                    } else {
+                        code.push_str(&format!("  {} = call {} @{}({})\n", v, llvm_type(&ret_t), name, argstr));
+                    }
                     v
                 }
             }
@@ -2513,6 +2577,7 @@ fn compile_llvm(prog: &Expr) {
     // declarations
     ir.push_str("declare i32 @printf(i8*, ...)\n");
     ir.push_str("declare i32 @puts(i8*)\n");
+    ir.push_str("declare i32 @snprintf(i8*, i64, i8*, ...)\n");
     ir.push_str("declare i64 @strlen(i8*)\n");
     ir.push_str("declare i8* @malloc(i64)\n");
     ir.push_str("declare i8* @getenv(i8*)\n");
@@ -2524,6 +2589,8 @@ fn compile_llvm(prog: &Expr) {
     // format strings
     ir.push_str("@fmt_i64 = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\", align 1\n");
     ir.push_str("@fmt_f64 = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\", align 1\n\n");
+    ir.push_str("@fmt_tstr_i64 = private unnamed_addr constant [5 x i8] c\"%lld\\00\", align 1\n");
+    ir.push_str("@fmt_tstr_f64 = private unnamed_addr constant [3 x i8] c\"%g\\00\", align 1\n\n");
 
     // str globals
     ir.push_str(&global_decls);
@@ -2656,54 +2723,66 @@ fn main() {
         return;
     }
 
-    let toks = tokenize(&src, &fpath);
-    let mut parser = Parser::new(toks, fpath.clone(), src.clone());
-    let prog = parser.parse_program();
-    check_prog(&prog, &fpath, &src);
+    // panics in codegen (regalloc, missing host fn, etc.) surface as a clean
+    // one-line diagnostic instead of a raw backtrace
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() { (*s).to_string() }
+            else if let Some(s) = info.payload().downcast_ref::<String>() { s.clone() }
+            else { "unknown panic".to_string() };
+        eprintln!("internal compiler error: {}", msg);
+    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let toks = tokenize(&src, &fpath);
+        let mut parser = Parser::new(toks, fpath.clone(), src.clone());
+        let prog = parser.parse_program();
+        check_prog(&prog, &fpath, &src);
 
-    if target == "wasm" {
-        let (wasm, html) = compile_wasm(&prog);
-        let base = out.clone().unwrap_or_else(|| fpath.trim_end_matches(".ail").to_string());
-        let wasm_path = format!("{}.wasm", base);
-        let html_path = format!("{}.html", base);
-        fs::write(&wasm_path, &wasm).expect("write wasm");
-        fs::write(&html_path, &html).expect("write html");
-        cache_store(&cache_bin, std::path::Path::new(&wasm_path));
-        println!("built {} and {}", wasm_path, html_path);
-        return;
-    }
-    if target == "c" {
-        compile_c(&prog);
-        cache_store(&cache_bin, std::path::Path::new("ail_out.exe"));
-        return;
-    }
-    if target == "llvm" {
-        compile_llvm(&prog);
-        cache_store(&cache_bin, std::path::Path::new("ail_out.exe"));
-        return;
-    }
-
-    let mut cx = Ctx::new();
-    cx.declare_funcs(&prog);
-    if let Expr::Program(fns) = &prog {
-        for f in fns {
-            cx.compile_fn(f);
+        if target == "wasm" {
+            let (wasm, html) = compile_wasm(&prog);
+            let base = out.clone().unwrap_or_else(|| fpath.trim_end_matches(".ail").to_string());
+            let wasm_path = format!("{}.wasm", base);
+            let html_path = format!("{}.html", base);
+            fs::write(&wasm_path, &wasm).expect("write wasm");
+            fs::write(&html_path, &html).expect("write html");
+            cache_store(&cache_bin, std::path::Path::new(&wasm_path));
+            println!("built {} and {}", wasm_path, html_path);
+            return;
         }
-    }
-    cx.module.finalize_definitions().unwrap();
-
-    // find main
-    let main_fid = match cx.funcs.get("main") {
-        Some(x) => x.0,
-        None => {
-            eprintln!();
-            eprintln!("error: program has no 'main' function");
-            eprintln!("  --> {}", fpath);
-            eprintln!("hint: define an entry point: (fn main () void ...)");
-            std::process::exit(1);
+        if target == "c" {
+            compile_c(&prog);
+            cache_store(&cache_bin, std::path::Path::new("ail_out.exe"));
+            return;
         }
-    };
-    let code_ptr = cx.module.get_finalized_function(main_fid);
-    let main_fn: extern "C" fn() = unsafe { std::mem::transmute(code_ptr) };
-    main_fn();
+        if target == "llvm" {
+            compile_llvm(&prog);
+            cache_store(&cache_bin, std::path::Path::new("ail_out.exe"));
+            return;
+        }
+
+        let mut cx = Ctx::new();
+        cx.declare_funcs(&prog);
+        if let Expr::Program(fns) = &prog {
+            for f in fns {
+                cx.compile_fn(f);
+            }
+        }
+        cx.module.finalize_definitions().unwrap();
+
+        // find main
+        let main_fid = match cx.funcs.get("main") {
+            Some(x) => x.0,
+            None => {
+                eprintln!();
+                eprintln!("error: program has no 'main' function");
+                eprintln!("  --> {}", fpath);
+                eprintln!("hint: define an entry point: (fn main () void ...)");
+                std::process::exit(1);
+            }
+        };
+        let code_ptr = cx.module.get_finalized_function(main_fid);
+        let main_fn: extern "C" fn() = unsafe { std::mem::transmute(code_ptr) };
+        main_fn();
+    }));
+    // a panic has already printed its one-line message via the hook above
+    if result.is_err() { std::process::exit(1); }
 }
