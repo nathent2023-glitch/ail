@@ -12,7 +12,25 @@ use cranelift_module::Module as _;
 
 // ---------- host functions ----------
 #[no_mangle]
+pub extern "C" fn ail_to_i64(x: f64) -> i64 { x as i64 }
+#[no_mangle]
 pub extern "C" fn ail_to_f64(x: i64) -> f64 { x as f64 }
+
+use std::ffi::{CStr, CString};
+use std::sync::LazyLock;
+static ENV_CACHE: LazyLock<std::sync::Mutex<HashMap<String, CString>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[no_mangle]
+pub extern "C" fn ail_env_str(key: *const u8) -> *const u8 {
+    if key.is_null() { return std::ptr::null(); }
+    let s = unsafe { CStr::from_ptr(key as *const i8).to_str().unwrap_or("") };
+    let mut cache = ENV_CACHE.lock().unwrap();
+    let val = std::env::var(s).unwrap_or_default();
+    if !cache.contains_key(s) || cache.get(s).map(|c| c.to_str().unwrap_or("") != val.as_str()).unwrap_or(true) {
+        cache.insert(s.to_string(), CString::new(val.clone()).unwrap());
+    }
+    let cstr = cache.get(s).unwrap();
+    cstr.as_ptr() as *const u8
+}
 #[no_mangle]
 pub extern "C" fn ail_print_i64(x: i64) { println!("{}", x); }
 #[no_mangle]
@@ -621,6 +639,7 @@ fn type_of(e: &Expr) -> String {
                 "js_eval" => "i64".into(),
                 "dom_set_inner_html" => "i64".into(),
                 "read_file" => "str".into(),
+                "env" => "str".into(),
                 "tokenize" => "array".into(),
                 "cross_entropy" => "f64".into(),
                 "to_f64" => "f64".into(),
@@ -753,7 +772,7 @@ impl<'a> TypeEnv<'a> {
             "gfx_open" => { if args.len() != 3 { self.error("gfx_open expects 3 arguments", ""); } for a in args { self.walk(a); } "gfx".into() }
             "gfx_pixel" | "gfx_show" | "gfx_close" => { if args.len() != 4 { self.error(&format!("{} expects 4 arguments", name), ""); } for a in args { self.walk(a); } "i64".into() }
             "gfx_poll" => { if args.len() != 1 { self.error("gfx_poll expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
-            "read_file" | "tokenize" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "str".into() }
+            "read_file" | "tokenize" | "env" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "str".into() }
             "softmax" => { if args.len() != 1 { self.error("softmax expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "cross_entropy" => { if args.len() != 2 { self.error("cross_entropy expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "f64".into() }
             "sgd_step" => { if args.len() != 3 { self.error("sgd_step expects 3 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); self.walk(&args[2]); "i64".into() }
@@ -811,6 +830,8 @@ impl Ctx {
         builder.symbol("ail_gfx_close", ail_gfx_close as *const u8);
         builder.symbol("ail_read_file", ail_read_file as *const u8);
         builder.symbol("ail_to_f64", ail_to_f64 as *const u8);
+        builder.symbol("ail_to_i64", ail_to_i64 as *const u8);
+        builder.symbol("ail_env_str", ail_env_str as *const u8);
         builder.symbol("ail_tokenize", ail_tokenize as *const u8);
         builder.symbol("ail_softmax", ail_softmax as *const u8);
         builder.symbol("ail_cross_entropy", ail_cross_entropy as *const u8);
@@ -822,6 +843,7 @@ impl Ctx {
         // declare host imports
         for (name, params, rets) in [
             ("ail_to_f64", vec![types::I64], vec![types::F64]),
+            ("ail_to_i64", vec![types::F64], vec![types::I64]),
             ("ail_pow_f64", vec![types::F64, types::F64], vec![types::F64]),
             ("ail_pow_i64", vec![types::I64, types::I64], vec![types::I64]),
             ("ail_print_i64", vec![types::I64], vec![]),
@@ -849,6 +871,7 @@ impl Ctx {
             ("ail_gfx_close", vec![types::I64], vec![]),
             ("ail_js_eval", vec![types::I64], vec![types::I64]),
             ("ail_dom_set_inner_html", vec![types::I64, types::I64], vec![types::I64]),
+            ("ail_env_str", vec![types::I64], vec![types::I64]),
             ("ail_read_file", vec![types::I64], vec![types::I64]),
             ("ail_tokenize", vec![types::I64], vec![types::I64]),
             ("ail_softmax", vec![types::I64], vec![]),
@@ -1052,6 +1075,25 @@ impl Ctx {
                     let call = builder.ins().call(fref, &[a]);
                     let res = builder.inst_results(call);
                     return Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] });
+                }
+                if name == "to_i64" && args.len() == 1 {
+                    if let Expr::Int(n) = &args[0] { return Some(builder.ins().iconst(types::I64, *n)); }
+                    if let Expr::Float(f) = &args[0] { return Some(builder.ins().iconst(types::I64, *f as i64)); }
+                    let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    if type_of(&args[0]) == "i64" { return Some(a); }
+                    let fid = self.host["ail_to_i64"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "env" && args.len() == 1 {
+                    let v = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_env_str"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[v]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
                 }
                 if name == "len" && !args.is_empty() {
                     let arg = args[0].clone();
@@ -1963,6 +2005,9 @@ fn gen_c_expr(e: &Expr) -> String {
                 "mat_add" => { if args.len() >= 2 { format!("ail_mat_add({}, {})", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0".into() } }
                 "mat_mul" => { if args.len() >= 2 { format!("ail_mat_mul({}, {})", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0".into() } }
                 "mat_relu" => { if !args.is_empty() { format!("ail_mat_relu({})", gen_c_expr(&args[0])) } else { "0".into() } }
+                "env" => { if !args.is_empty() { format!("getenv({})", gen_c_expr(&args[0])) } else { "NULL".into() } }
+                "to_f64" => { if !args.is_empty() { format!("(double)({})", gen_c_expr(&args[0])) } else { "0.0".into() } }
+                "to_i64" => { if !args.is_empty() { format!("(long long)({})", gen_c_expr(&args[0])) } else { "0".into() } }
                 _ => {
                     // user function call
                     let a: Vec<String> = args.iter().map(gen_c_expr).collect();
@@ -2068,8 +2113,13 @@ fn compile_c(prog: &Expr) {
                 code.push_str(&format!("    {} {} = 0;\n", ctype(vty), vname));
             }
             // body
-            for e in body {
-                code.push_str(&format!("    {}\n", gen_c_stmt(e)));
+            let last_idx = if ret != "void" && !body.is_empty() { Some(body.len() - 1) } else { None };
+            for (i, e) in body.iter().enumerate() {
+                if Some(i) == last_idx {
+                    code.push_str(&format!("    return {};\n", gen_c_expr(e)));
+                } else {
+                    code.push_str(&format!("    {}\n", gen_c_stmt(e)));
+                }
             }
             if ret != "void" && body.is_empty() {
                 // return default
@@ -2269,6 +2319,34 @@ fn gen_llvm_expr(e: &Expr, ctx: &mut LlvmCtx, code: &mut String) -> String {
                     // not a builtin name in Ail; handled as function? skip
                     "0".into()
                 }
+                "env" => {
+                    if !args.is_empty() {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        let v = ctx.temp();
+                        code.push_str(&format!("  {} = call i8* @getenv(i8* {})\n", v, a));
+                        v
+                    } else { "0".into() }
+                }
+                "to_f64" => {
+                    if !args.is_empty() {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        if type_of(&args[0]) == "f64" { a } else {
+                            let v = ctx.temp();
+                            code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, a));
+                            v
+                        }
+                    } else { "0.0".into() }
+                }
+                "to_i64" => {
+                    if !args.is_empty() {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        if type_of(&args[0]) == "f64" {
+                            let v = ctx.temp();
+                            code.push_str(&format!("  {} = fptosi double {} to i64\n", v, a));
+                            v
+                        } else { a }
+                    } else { "0".into() }
+                }
                 _ => {
                     // user function or unknown
                     let a: Vec<String> = args.iter().map(|x| {
@@ -2437,6 +2515,7 @@ fn compile_llvm(prog: &Expr) {
     ir.push_str("declare i32 @puts(i8*)\n");
     ir.push_str("declare i64 @strlen(i8*)\n");
     ir.push_str("declare i8* @malloc(i64)\n");
+    ir.push_str("declare i8* @getenv(i8*)\n");
     ir.push_str("declare i8* @memcpy(i8*, i8*, i64)\n");
     ir.push_str("declare void @ail_print_i64(i64)\n");
     ir.push_str("declare void @ail_print_f64(double)\n");
@@ -2498,7 +2577,6 @@ fn compile_llvm(prog: &Expr) {
     }
 }
 
-use std::hash::{Hash, Hasher};
 
 fn ail_cache_root() -> std::path::PathBuf {
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".to_string());
@@ -2507,9 +2585,19 @@ fn ail_cache_root() -> std::path::PathBuf {
 
 fn ail_cache_dir(target: &str, src: &str) -> std::path::PathBuf {
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     target.hash(&mut h);
     src.hash(&mut h);
+    // include compiler version to prevent reusing stale binaries after updates
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    // include a hash of the running ailc binary so compiler-code changes
+    // invalidate cached binaries even when CARGO_PKG_VERSION is unchanged
+    let mut eh = DefaultHasher::new();
+    if let Ok(bytes) = std::fs::read(std::env::current_exe().unwrap_or_default()) {
+        bytes.hash(&mut eh);
+        eh.finish().hash(&mut h);
+    }
     let key = format!("{:x}", h.finish());
     ail_cache_root().join(key)
 }
@@ -2549,12 +2637,23 @@ fn main() {
         Err(e) => { eprintln!("error: cannot read '{}': {}", fpath, e); std::process::exit(1); }
     };
 
-    // binary cache: skip recompile if cached
+    // binary cache: skip recompile if cached, but do NOT execute cached binary
     let cache_dir = ail_cache_dir(&target, &src);
     let cache_bin = cache_binary_path(&cache_dir, &target);
     if target != "native" && cache_bin.exists() {
-        let status = std::process::Command::new(&cache_bin).status();
-        std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
+        // Restore cached output artifact instead of running it.
+        if target == "wasm" {
+            let base = out.clone().unwrap_or_else(|| fpath.trim_end_matches(".ail").to_string());
+            let wasm_path = format!("{}.wasm", base);
+            let html_path = format!("{}.html", base);
+            let _ = std::fs::copy(&cache_bin, &wasm_path);
+            // Minimal html restore so compiled artifacts remain consistent
+            let html = format!("<!DOCTYPE html><html><head><title>Ail</title></head><body><script>/* was cached */</script></body></html>");
+            let _ = std::fs::write(&html_path, html);
+        } else {
+            let _ = std::fs::copy(&cache_bin, "ail_out.exe");
+        }
+        return;
     }
 
     let toks = tokenize(&src, &fpath);
