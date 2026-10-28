@@ -104,6 +104,41 @@ pub extern "C" fn ail_array_len(h: i64) -> i64 {
     if idx < arrs.len() { arrs[idx].len() as i64 } else { 0 }
 }
 
+// ---------- scalar math host functions (native JIT) ----------
+#[no_mangle]
+pub extern "C" fn ail_min_i64(a: i64, b: i64) -> i64 { a.min(b) }
+#[no_mangle]
+pub extern "C" fn ail_max_i64(a: i64, b: i64) -> i64 { a.max(b) }
+#[no_mangle]
+pub extern "C" fn ail_abs_i64(a: i64) -> i64 { a.abs() }
+#[no_mangle]
+pub extern "C" fn ail_min_f64(a: f64, b: f64) -> f64 { a.min(b) }
+#[no_mangle]
+pub extern "C" fn ail_max_f64(a: f64, b: f64) -> f64 { a.max(b) }
+#[no_mangle]
+pub extern "C" fn ail_abs_f64(a: f64) -> f64 { a.abs() }
+#[no_mangle]
+pub extern "C" fn ail_sqrt(x: f64) -> f64 { x.sqrt() }
+#[no_mangle]
+pub extern "C" fn ail_floor(x: f64) -> f64 { x.floor() }
+#[no_mangle]
+pub extern "C" fn ail_ceil(x: f64) -> f64 { x.ceil() }
+#[no_mangle]
+pub extern "C" fn ail_round(x: f64) -> f64 { x.round() }
+#[no_mangle]
+pub extern "C" fn ail_exp(x: f64) -> f64 { x.exp() }
+#[no_mangle]
+pub extern "C" fn ail_ln(x: f64) -> f64 { x.ln() }
+#[no_mangle]
+pub extern "C" fn ail_pow_f64(a: f64, b: f64) -> f64 { a.powf(b) }
+#[no_mangle]
+pub extern "C" fn ail_sum(h: i64) -> i64 {
+    if h <= 0 { return 0; }
+    let arrs = ARRAYS.lock().unwrap();
+    let idx = (h - 1) as usize;
+    arrs.get(idx).map(|v| v.iter().sum::<i64>()).unwrap_or(0)
+}
+
 struct Mat { rows: usize, cols: usize, data: Vec<f64> }
 static MATS: std::sync::LazyLock<Mutex<Vec<Option<Mat>>>> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -571,6 +606,10 @@ impl Parser {
                             args.push(self.parse_expr());
                         }
                         expect_rp(self);
+                        // unary minus: (- x) is sugar for 0 - x
+                        if head == "-" && args.len() == 1 {
+                            args.insert(0, Expr::Int(0));
+                        }
                         Expr::Call(head, args)
                     }
                 }
@@ -658,6 +697,10 @@ fn type_of(e: &Expr) -> String {
                 "cross_entropy" => "f64".into(),
                 "to_f64" => "f64".into(),
                 "to_i64" => "i64".into(),
+                "sqrt" | "exp" | "ln" | "floor" | "ceil" | "round" | "pow" => "f64".into(),
+                "min" | "max" => if args.iter().any(|a| type_of(a) == "f64") { "f64".into() } else { "i64".into() },
+                "abs" => if args.first().map(|a| type_of(a)) == Some("f64".to_string()) { "f64".into() } else { "i64".into() },
+                "sum" => "i64".into(),
                 _ => FN_TYPES.lock().unwrap().get(name).cloned().map(|(_, r)| r).unwrap_or_else(|| "i64".into()),
             }
         }
@@ -789,6 +832,16 @@ impl<'a> TypeEnv<'a> {
             "gfx_poll" => { if args.len() != 1 { self.error("gfx_poll expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "read_file" | "tokenize" | "env" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "str".into() }
             "to_str" => { if args.len() != 1 { self.error("to_str expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "i64" && a != "f64" { self.error("to_str expects i64 or f64", ""); } "str".into() }
+            "sqrt" | "exp" | "ln" | "floor" | "ceil" | "round" => { if args.len() != 1 { self.error(&format!("{} expects 1 argument", name), ""); } self.walk(&args[0]); "f64".into() }
+            "pow" => { if args.len() != 2 { self.error("pow expects 2 arguments", ""); } for a in args { self.walk(a); } "f64".into() }
+            "min" | "max" => {
+                if args.len() != 2 { self.error(&format!("{} expects 2 arguments", name), ""); }
+                let a = self.walk(&args[0]); let b = self.walk(&args[1]);
+                if a == "str" || b == "str" { self.error("min/max do not accept str", ""); }
+                if a == "f64" || b == "f64" { "f64".into() } else { "i64".into() }
+            }
+            "abs" => { if args.len() != 1 { self.error("abs expects 1 argument", ""); } let a = self.walk(&args[0]); if a == "str" { self.error("abs does not accept str", ""); } if a == "f64" { "f64".into() } else { "i64".into() } }
+            "sum" => { if args.len() != 1 { self.error("sum expects 1 argument", ""); } let a = self.walk(&args[0]); if a != "array" { self.error("sum expects an array", ""); } "i64".into() }
             "softmax" => { if args.len() != 1 { self.error("softmax expects 1 argument", ""); } self.walk(&args[0]); "i64".into() }
             "cross_entropy" => { if args.len() != 2 { self.error("cross_entropy expects 2 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); "f64".into() }
             "sgd_step" => { if args.len() != 3 { self.error("sgd_step expects 3 arguments", ""); } self.walk(&args[0]); self.walk(&args[1]); self.walk(&args[2]); "i64".into() }
@@ -841,6 +894,20 @@ impl Ctx {
         builder.symbol("ail_array_push", ail_array_push as *const u8);
         builder.symbol("ail_array_get", ail_array_get as *const u8);
         builder.symbol("ail_array_len", ail_array_len as *const u8);
+        builder.symbol("ail_min_i64", ail_min_i64 as *const u8);
+        builder.symbol("ail_max_i64", ail_max_i64 as *const u8);
+        builder.symbol("ail_abs_i64", ail_abs_i64 as *const u8);
+        builder.symbol("ail_min_f64", ail_min_f64 as *const u8);
+        builder.symbol("ail_max_f64", ail_max_f64 as *const u8);
+        builder.symbol("ail_abs_f64", ail_abs_f64 as *const u8);
+        builder.symbol("ail_sqrt", ail_sqrt as *const u8);
+        builder.symbol("ail_floor", ail_floor as *const u8);
+        builder.symbol("ail_ceil", ail_ceil as *const u8);
+        builder.symbol("ail_round", ail_round as *const u8);
+        builder.symbol("ail_exp", ail_exp as *const u8);
+        builder.symbol("ail_ln", ail_ln as *const u8);
+        builder.symbol("ail_pow_f64", ail_pow_f64 as *const u8);
+        builder.symbol("ail_sum", ail_sum as *const u8);
         builder.symbol("ail_mat_new", ail_mat_new as *const u8);
         builder.symbol("ail_mat_set", ail_mat_set as *const u8);
         builder.symbol("ail_mat_get", ail_mat_get as *const u8);
@@ -875,7 +942,6 @@ impl Ctx {
             ("ail_to_str_i64", vec![types::I64], vec![types::I64]),
             ("ail_to_str_f64", vec![types::F64], vec![types::I64]),
             ("ail_pow_f64", vec![types::F64, types::F64], vec![types::F64]),
-            ("ail_pow_i64", vec![types::I64, types::I64], vec![types::I64]),
             ("ail_print_i64", vec![types::I64], vec![]),
             ("ail_print_f64", vec![types::F64], vec![]),
             ("ail_print_bool", vec![types::I64], vec![]),
@@ -886,6 +952,19 @@ impl Ctx {
             ("ail_array_push", vec![types::I64, types::I64], vec![]),
             ("ail_array_get", vec![types::I64, types::I64], vec![types::I64]),
             ("ail_array_len", vec![types::I64], vec![types::I64]),
+            ("ail_min_i64", vec![types::I64, types::I64], vec![types::I64]),
+            ("ail_max_i64", vec![types::I64, types::I64], vec![types::I64]),
+            ("ail_abs_i64", vec![types::I64], vec![types::I64]),
+            ("ail_min_f64", vec![types::F64, types::F64], vec![types::F64]),
+            ("ail_max_f64", vec![types::F64, types::F64], vec![types::F64]),
+            ("ail_abs_f64", vec![types::F64], vec![types::F64]),
+            ("ail_sqrt", vec![types::F64], vec![types::F64]),
+            ("ail_floor", vec![types::F64], vec![types::F64]),
+            ("ail_ceil", vec![types::F64], vec![types::F64]),
+            ("ail_round", vec![types::F64], vec![types::F64]),
+            ("ail_exp", vec![types::F64], vec![types::F64]),
+            ("ail_ln", vec![types::F64], vec![types::F64]),
+            ("ail_sum", vec![types::I64], vec![types::I64]),
             ("ail_mat_new", vec![types::I64, types::I64], vec![types::I64]),
             ("ail_mat_set", vec![types::I64, types::I64, types::I64, types::F64], vec![]),
             ("ail_mat_get", vec![types::I64, types::I64, types::I64], vec![types::F64]),
@@ -1130,6 +1209,81 @@ impl Ctx {
                     let fid = self.host["ail_env_str"];
                     let fref = self.module.declare_func_in_func(fid, builder.func);
                     let call = builder.ins().call(fref, &[v]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                // scalar math: f64 fns widen int args like arithmetic does
+                for (mn, hn) in [("sqrt", "ail_sqrt"), ("exp", "ail_exp"), ("ln", "ail_ln"), ("floor", "ail_floor"), ("ceil", "ail_ceil"), ("round", "ail_round")] {
+                    if name == mn && args.len() == 1 {
+                        let mut a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                        if type_of(&args[0]) != "f64" {
+                            let cv = self.host["ail_to_f64"];
+                            let cref = self.module.declare_func_in_func(cv, builder.func);
+                            let c = builder.ins().call(cref, &[a]);
+                            a = *builder.inst_results(c).first().unwrap_or(&a);
+                        }
+                        let fid = self.host[hn];
+                        let fref = self.module.declare_func_in_func(fid, builder.func);
+                        let call = builder.ins().call(fref, &[a]);
+                        let res = builder.inst_results(call);
+                        return Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] });
+                    }
+                }
+                if name == "pow" && args.len() == 2 {
+                    let mut a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let mut b = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    if type_of(&args[0]) != "f64" {
+                        let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                        let c = builder.ins().call(cref, &[a]); a = *builder.inst_results(c).first().unwrap_or(&a);
+                    }
+                    if type_of(&args[1]) != "f64" {
+                        let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                        let c = builder.ins().call(cref, &[b]); b = *builder.inst_results(c).first().unwrap_or(&b);
+                    }
+                    let fid = self.host["ail_pow_f64"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a, b]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] });
+                }
+                if (name == "min" || name == "max") && args.len() == 2 {
+                    let t0 = type_of(&args[0]); let t1 = type_of(&args[1]);
+                    let mut a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let mut b = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    if t0 == "f64" || t1 == "f64" {
+                        if t0 != "f64" {
+                            let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                            let c = builder.ins().call(cref, &[a]); a = *builder.inst_results(c).first().unwrap_or(&a);
+                        }
+                        if t1 != "f64" {
+                            let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                            let c = builder.ins().call(cref, &[b]); b = *builder.inst_results(c).first().unwrap_or(&b);
+                        }
+                        let fid = self.host[if name == "min" { "ail_min_f64" } else { "ail_max_f64" }];
+                        let fref = self.module.declare_func_in_func(fid, builder.func);
+                        let call = builder.ins().call(fref, &[a, b]);
+                        let res = builder.inst_results(call);
+                        return Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] });
+                    }
+                    let fid = self.host[if name == "min" { "ail_min_i64" } else { "ail_max_i64" }];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a, b]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "abs" && args.len() == 1 {
+                    let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host[if type_of(&args[0]) == "f64" { "ail_abs_f64" } else { "ail_abs_i64" }];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a]);
+                    let res = builder.inst_results(call);
+                    return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
+                }
+                if name == "sum" && args.len() == 1 {
+                    let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                    let fid = self.host["ail_sum"];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a]);
                     let res = builder.inst_results(call);
                     return Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] });
                 }
@@ -2052,6 +2206,28 @@ fn gen_c_expr(e: &Expr) -> String {
                         if type_of(&args[0]) == "f64" { format!("ail_to_str_f64({})", v) } else { format!("ail_to_str_i64({})", v) }
                     } else { "NULL".into() }
                 }
+                "sqrt" | "exp" | "ln" | "floor" | "ceil" | "round" => {
+                    if !args.is_empty() {
+                        let cn = if name == "ln" { "log" } else { name.as_str() };
+                        format!("{}((double)({}))", cn, gen_c_expr(&args[0]))
+                    } else { "0.0".into() }
+                }
+                "pow" => { if args.len() >= 2 { format!("pow((double)({}), (double)({}))", gen_c_expr(&args[0]), gen_c_expr(&args[1])) } else { "0.0".into() } }
+                "min" | "max" => {
+                    if args.len() >= 2 {
+                        let a = gen_c_expr(&args[0]); let b = gen_c_expr(&args[1]);
+                        if type_of(&args[0]) == "f64" || type_of(&args[1]) == "f64" {
+                            format!("f{}((double)({}), (double)({}))", name, a, b)
+                        } else if name == "min" { format!("ail_min_i64({}, {})", a, b) } else { format!("ail_max_i64({}, {})", a, b) }
+                    } else { "0".into() }
+                }
+                "abs" => {
+                    if !args.is_empty() {
+                        let v = gen_c_expr(&args[0]);
+                        if type_of(&args[0]) == "f64" { format!("fabs((double)({}))", v) } else { format!("ail_abs_i64({})", v) }
+                    } else { "0".into() }
+                }
+                "sum" => { if !args.is_empty() { format!("ail_sum({})", gen_c_expr(&args[0])) } else { "0".into() } }
                 _ => {
                     // user function call
                     let a: Vec<String> = args.iter().map(gen_c_expr).collect();
@@ -2104,7 +2280,7 @@ fn compile_c(prog: &Expr) {
     let fns: Vec<&Expr> = if let Expr::Program(fns) = prog { fns.iter().filter(|e| matches!(e, Expr::Fn{..})).collect() } else { vec![] };
 
     let mut code = String::new();
-    code.push_str("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n");
+    code.push_str("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\n");
 
     // structs
     code.push_str("typedef struct { long long len, cap; long long *data; } Arr;\n");
@@ -2125,6 +2301,11 @@ fn compile_c(prog: &Expr) {
     code.push_str("void ail_array_push(Arr* a,long long v){ if(a->len==a->cap){ a->cap*=2; a->data=realloc(a->data,a->cap*sizeof(long long)); } a->data[a->len++]=v; }\n");
     code.push_str("long long ail_array_get(Arr* a,long long i){ if(i<0||i>=a->len) return 0; return a->data[i]; }\n");
     code.push_str("long long ail_array_len(Arr* a){ return a->len; }\n");
+    // scalar math + sum helpers
+    code.push_str("long long ail_min_i64(long long a, long long b){ return a<b?a:b; }\n");
+    code.push_str("long long ail_max_i64(long long a, long long b){ return a>b?a:b; }\n");
+    code.push_str("long long ail_abs_i64(long long a){ return a<0?-a:a; }\n");
+    code.push_str("long long ail_sum(Arr* a){ long long s=0; if(a) for(long long i=0;i<a->len;i++) s+=a->data[i]; return s; }\n");
 
     // mat helpers
     code.push_str("Mat* ail_mat_new(long long r,long long c){ Mat* m=malloc(sizeof(Mat)); m->rows=r; m->cols=c; m->data=calloc((size_t)(r*c),sizeof(double)); return m; }\n");
@@ -2406,6 +2587,80 @@ fn gen_llvm_expr(e: &Expr, ctx: &mut LlvmCtx, code: &mut String) -> String {
                         buf
                     } else { "0".into() }
                 }
+                "sqrt" | "exp" | "ln" | "floor" | "ceil" | "round" => {
+                    if !args.is_empty() {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        let cn = if name == "ln" { "log" } else { name.as_str() };
+                        if type_of(&args[0]) == "f64" {
+                            let v = ctx.temp();
+                            code.push_str(&format!("  {} = call double @{}(double {})\n", v, cn, a));
+                            v
+                        } else {
+                            let w = ctx.temp();
+                            code.push_str(&format!("  {} = sitofp i64 {} to double\n", w, a));
+                            let v = ctx.temp();
+                            code.push_str(&format!("  {} = call double @{}(double {})\n", v, cn, w));
+                            v
+                        }
+                    } else { "0.0".into() }
+                }
+                "pow" => {
+                    if args.len() >= 2 {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        let b = gen_llvm_expr(&args[1], ctx, code);
+                        let aw = if type_of(&args[0]) == "f64" { a } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, a)); v };
+                        let bw = if type_of(&args[1]) == "f64" { b } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, b)); v };
+                        let v = ctx.temp();
+                        code.push_str(&format!("  {} = call double @pow(double {}, double {})\n", v, aw, bw));
+                        v
+                    } else { "0.0".into() }
+                }
+                "min" | "max" => {
+                    if args.len() >= 2 {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        let b = gen_llvm_expr(&args[1], ctx, code);
+                        if type_of(&args[0]) == "f64" || type_of(&args[1]) == "f64" {
+                            let fnm = if name == "min" { "fmin" } else { "fmax" };
+                            let aw = if type_of(&args[0]) == "f64" { a } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, a)); v };
+                            let bw = if type_of(&args[1]) == "f64" { b } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, b)); v };
+                            let v = ctx.temp();
+                            code.push_str(&format!("  {} = call double @{}(double {}, double {})\n", v, fnm, aw, bw));
+                            v
+                        } else {
+                            let cmp = ctx.temp();
+                            let v = ctx.temp();
+                            if name == "min" {
+                                code.push_str(&format!("  {} = icmp slt i64 {}, {}\n", cmp, a, b));
+                                code.push_str(&format!("  {} = select i1 {}, i64 {}, i64 {}\n", v, cmp, a, b));
+                            } else {
+                                code.push_str(&format!("  {} = icmp sgt i64 {}, {}\n", cmp, a, b));
+                                code.push_str(&format!("  {} = select i1 {}, i64 {}, i64 {}\n", v, cmp, a, b));
+                            }
+                            v
+                        }
+                    } else { "0".into() }
+                }
+                "abs" => {
+                    if !args.is_empty() {
+                        let a = gen_llvm_expr(&args[0], ctx, code);
+                        if type_of(&args[0]) == "f64" {
+                            let v = ctx.temp();
+                            code.push_str(&format!("  {} = call double @fabs(double {})\n", v, a));
+                            v
+                        } else {
+                            let n = ctx.temp(); let c = ctx.temp(); let v = ctx.temp();
+                            code.push_str(&format!("  {} = sub i64 0, {}\n", n, a));
+                            code.push_str(&format!("  {} = icmp slt i64 {}, 0\n", c, a));
+                            code.push_str(&format!("  {} = select i1 {}, i64 {}, i64 {}\n", v, c, n, a));
+                            v
+                        }
+                    } else { "0".into() }
+                }
+                "sum" => {
+                    // arrays have no LLVM representation yet; fail clearly instead of a link error
+                    eprintln!("error: 'sum' is not supported on the llvm backend (arrays are not lowered to LLVM yet)");
+                    std::process::exit(1);
+                }
                 _ => {
                     // user function or unknown
                     let a: Vec<String> = args.iter().map(|x| {
@@ -2578,6 +2833,16 @@ fn compile_llvm(prog: &Expr) {
     ir.push_str("declare i32 @printf(i8*, ...)\n");
     ir.push_str("declare i32 @puts(i8*)\n");
     ir.push_str("declare i32 @snprintf(i8*, i64, i8*, ...)\n");
+    ir.push_str("declare double @sqrt(double)\n");
+    ir.push_str("declare double @pow(double, double)\n");
+    ir.push_str("declare double @exp(double)\n");
+    ir.push_str("declare double @log(double)\n");
+    ir.push_str("declare double @floor(double)\n");
+    ir.push_str("declare double @ceil(double)\n");
+    ir.push_str("declare double @round(double)\n");
+    ir.push_str("declare double @fmin(double, double)\n");
+    ir.push_str("declare double @fmax(double, double)\n");
+    ir.push_str("declare double @fabs(double)\n");
     ir.push_str("declare i64 @strlen(i8*)\n");
     ir.push_str("declare i8* @malloc(i64)\n");
     ir.push_str("declare i8* @getenv(i8*)\n");

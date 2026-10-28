@@ -196,3 +196,31 @@ fn user_fn_all_backends() {
         assert_stdout("(fn add (a i64 b i64) i64 (+ a b)) (fn main () void (print (add 3 4)))", t, "7");
     }
 }
+
+#[test]
+fn math_all_backends() {
+    for t in ["native", "llvm", "c", "wasm"] {
+        assert_stdout(
+            "(fn main () void (print (- 7)) (print (sqrt 4.0)) (print (min 3 7)) (print (max 2.5 1.5)) (print (abs (- 5))) (print (pow 2.0 3)) (print (exp 0.0)) (print (ln 1.0)) (print (floor 2.7)) (print (ceil 2.1)) (print (round 2.5)))",
+            t,
+            "-7\n2\n3\n2.5\n5\n8\n1\n0\n2\n3\n3",
+        );
+    }
+}
+
+#[test]
+fn sum_native_and_c() {
+    for t in ["native", "c"] {
+        assert_stdout(
+            "(fn main () void (let a (array)) (push a 3) (push a 4) (print (sum a)))",
+            t,
+            "7",
+        );
+    }
+    // llvm: arrays are not lowered yet -> clean compile failure
+    let (out, _dir) = compile("(fn main () void (print (sum (array))))", "llvm");
+    assert!(!out.status.success(), "sum should fail to compile on llvm");
+    // wasm is compile-only: only check it builds
+    let (w, _d) = compile("(fn main () void (let a (array)) (push a 3) (print (sum a)))", "wasm");
+    assert!(w.status.success(), "sum should compile on wasm");
+}
