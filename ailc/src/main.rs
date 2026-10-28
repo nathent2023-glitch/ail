@@ -21,6 +21,211 @@ use std::sync::LazyLock;
 static ENV_CACHE: LazyLock<std::sync::Mutex<HashMap<String, CString>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 // declared user-fn (param types, return type), filled by the checker before codegen
 static FN_TYPES: LazyLock<std::sync::Mutex<HashMap<String, (Vec<String>, String)>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+// ---------- builtin registry (table-driven) ----------
+// Each builtin is one row. The dispatch loops in type_of / checker / JIT / C / LLVM
+// consult this table before falling through to their bespoke match arms.
+#[derive(Clone, Copy)]
+enum BuiltinKind {
+    // (i64) -> i64  (host fn name)
+    UnaryI64(&'static str),
+    // (f64) -> f64  (host fn name)
+    UnaryF64(&'static str),
+    // (f64, f64) -> f64  (host fn name)
+    BinaryF64(&'static str),
+    // (i64, i64) -> i64  (host fn name)
+    BinaryI64(&'static str),
+    // min/max: type depends on args (i64 or f64)
+    MinMax,
+    // abs: type depends on arg
+    Abs,
+    // to_f64: (any) -> f64
+    ToF64,
+    // to_i64: (any) -> i64
+    ToI64,
+    // to_str: (i64 or f64) -> str
+    ToStr,
+    // sum: (array) -> i64
+    Sum,
+}
+
+struct Builtin {
+    name: &'static str,
+    arity: usize,
+    kind: BuiltinKind,
+}
+
+static BUILTINS: &[Builtin] = &[
+    Builtin { name: "sqrt",  arity: 1, kind: BuiltinKind::UnaryF64("ail_sqrt") },
+    Builtin { name: "exp",   arity: 1, kind: BuiltinKind::UnaryF64("ail_exp") },
+    Builtin { name: "ln",    arity: 1, kind: BuiltinKind::UnaryF64("ail_ln") },
+    Builtin { name: "floor", arity: 1, kind: BuiltinKind::UnaryF64("ail_floor") },
+    Builtin { name: "ceil",  arity: 1, kind: BuiltinKind::UnaryF64("ail_ceil") },
+    Builtin { name: "round", arity: 1, kind: BuiltinKind::UnaryF64("ail_round") },
+    Builtin { name: "pow",   arity: 2, kind: BuiltinKind::BinaryF64("ail_pow_f64") },
+    Builtin { name: "min",   arity: 2, kind: BuiltinKind::MinMax },
+    Builtin { name: "max",   arity: 2, kind: BuiltinKind::MinMax },
+    Builtin { name: "abs",   arity: 1, kind: BuiltinKind::Abs },
+    Builtin { name: "to_f64", arity: 1, kind: BuiltinKind::ToF64 },
+    Builtin { name: "to_i64", arity: 1, kind: BuiltinKind::ToI64 },
+    Builtin { name: "to_str", arity: 1, kind: BuiltinKind::ToStr },
+    Builtin { name: "sum",   arity: 1, kind: BuiltinKind::Sum },
+];
+
+fn lookup_builtin(name: &str) -> Option<&'static Builtin> {
+    BUILTINS.iter().find(|b| b.name == name)
+}
+
+fn builtin_ret_type(b: &Builtin, args: &[Expr]) -> String {
+    match b.kind {
+        BuiltinKind::UnaryF64(_) => "f64".into(),
+        BuiltinKind::BinaryF64(_) => "f64".into(),
+        BuiltinKind::UnaryI64(_) => "i64".into(),
+        BuiltinKind::BinaryI64(_) => "i64".into(),
+        BuiltinKind::ToF64 => "f64".into(),
+        BuiltinKind::ToI64 => "i64".into(),
+        BuiltinKind::ToStr => "str".into(),
+        BuiltinKind::Sum => "i64".into(),
+        BuiltinKind::MinMax => {
+            if args.iter().any(|a| type_of(a) == "f64") { "f64".into() } else { "i64".into() }
+        }
+        BuiltinKind::Abs => {
+            if args.first().map(|a| type_of(a)) == Some("f64".to_string()) { "f64".into() } else { "i64".into() }
+        }
+    }
+}
+// ---------- JIT dispatch for table-driven builtins ----------
+impl Ctx {
+    fn jit_builtin(&mut self, builder: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, b: &Builtin, args: &[Expr]) -> Option<Value> {
+        match b.kind {
+            BuiltinKind::UnaryF64(hn) => {
+                let mut a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                if type_of(&args[0]) != "f64" {
+                    let cv = self.host["ail_to_f64"];
+                    let cref = self.module.declare_func_in_func(cv, builder.func);
+                    let c = builder.ins().call(cref, &[a]);
+                    a = *builder.inst_results(c).first().unwrap_or(&a);
+                }
+                let fid = self.host[hn];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] })
+            }
+            BuiltinKind::UnaryI64(hn) => {
+                let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let fid = self.host[hn];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] })
+            }
+            BuiltinKind::BinaryF64(hn) => {
+                let mut a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let mut bb = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                if type_of(&args[0]) != "f64" {
+                    let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                    let c = builder.ins().call(cref, &[a]); a = *builder.inst_results(c).first().unwrap_or(&a);
+                }
+                if type_of(&args[1]) != "f64" {
+                    let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                    let c = builder.ins().call(cref, &[bb]); bb = *builder.inst_results(c).first().unwrap_or(&bb);
+                }
+                let fid = self.host[hn];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a, bb]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] })
+            }
+            BuiltinKind::BinaryI64(hn) => {
+                let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let bb = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let fid = self.host[hn];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a, bb]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] })
+            }
+            BuiltinKind::MinMax => {
+                let t0 = type_of(&args[0]); let t1 = type_of(&args[1]);
+                let mut a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let mut bb = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                if t0 == "f64" || t1 == "f64" {
+                    if t0 != "f64" {
+                        let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                        let c = builder.ins().call(cref, &[a]); a = *builder.inst_results(c).first().unwrap_or(&a);
+                    }
+                    if t1 != "f64" {
+                        let cv = self.host["ail_to_f64"]; let cref = self.module.declare_func_in_func(cv, builder.func);
+                        let c = builder.ins().call(cref, &[bb]); bb = *builder.inst_results(c).first().unwrap_or(&bb);
+                    }
+                    let hn = if b.name == "min" { "ail_min_f64" } else { "ail_max_f64" };
+                    let fid = self.host[hn];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a, bb]);
+                    let res = builder.inst_results(call);
+                    Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] })
+                } else {
+                    let hn = if b.name == "min" { "ail_min_i64" } else { "ail_max_i64" };
+                    let fid = self.host[hn];
+                    let fref = self.module.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(fref, &[a, bb]);
+                    let res = builder.inst_results(call);
+                    Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] })
+                }
+            }
+            BuiltinKind::Abs => {
+                let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let hn = if type_of(&args[0]) == "f64" { "ail_abs_f64" } else { "ail_abs_i64" };
+                let fid = self.host[hn];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() {
+                    if type_of(&args[0]) == "f64" { builder.ins().f64const(0.0) } else { builder.ins().iconst(types::I64, 0) }
+                } else { res[0] })
+            }
+            BuiltinKind::ToF64 => {
+                if let Expr::Int(n) = &args[0] { return Some(builder.ins().f64const(*n as f64)); }
+                let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                if type_of(&args[0]) == "f64" { return Some(a); }
+                let fid = self.host["ail_to_f64"];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().f64const(0.0) } else { res[0] })
+            }
+            BuiltinKind::ToI64 => {
+                if let Expr::Int(n) = &args[0] { return Some(builder.ins().iconst(types::I64, *n)); }
+                if let Expr::Float(f) = &args[0] { return Some(builder.ins().iconst(types::I64, *f as i64)); }
+                let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                if type_of(&args[0]) == "i64" { return Some(a); }
+                let fid = self.host["ail_to_i64"];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] })
+            }
+            BuiltinKind::ToStr => {
+                let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let fid = self.host[if type_of(&args[0]) == "f64" { "ail_to_str_f64" } else { "ail_to_str_i64" }];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] })
+            }
+            BuiltinKind::Sum => {
+                let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+                let fid = self.host["ail_sum"];
+                let fref = self.module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[a]);
+                let res = builder.inst_results(call);
+                Some(if res.is_empty() { builder.ins().iconst(types::I64, 0) } else { res[0] })
+            }
+        }
+    }
+}
+
 // Returned string is process-lifetime (leaked); safe for str_concat composition
 #[no_mangle]
 pub extern "C" fn ail_to_str_i64(x: i64) -> *const u8 {
@@ -668,6 +873,9 @@ fn type_of(e: &Expr) -> String {
         Expr::Block(v) => v.last().map(type_of).unwrap_or_else(|| "i64".into()),
         Expr::While(_, _) => "i64".into(),
         Expr::Call(name, args) => {
+            if let Some(b) = lookup_builtin(name) {
+                return builtin_ret_type(b, args);
+            }
             match name.as_str() {
                 "+" | "-" | "*" | "/" | "%" => {
                     if args.iter().any(|a| type_of(a) == "str") { "str".into() }
@@ -792,6 +1000,36 @@ impl<'a> TypeEnv<'a> {
     }
 
     fn check_call(&mut self, name: &str, args: &[Expr]) -> String {
+        // builtin registry (table-driven)
+        if let Some(b) = lookup_builtin(name) {
+            // validate arity
+            if args.len() != b.arity {
+                self.error(&format!("'{}' expects {} arguments, got {}", name, b.arity, args.len()), "");
+            }
+            // validate args per kind
+            match b.kind {
+                BuiltinKind::UnaryF64(_) | BuiltinKind::UnaryI64(_) | BuiltinKind::ToF64 | BuiltinKind::ToI64 | BuiltinKind::Abs => {
+                    if !args.is_empty() { self.walk(&args[0]); }
+                }
+                BuiltinKind::BinaryF64(_) | BuiltinKind::BinaryI64(_) | BuiltinKind::MinMax => {
+                    if args.len() >= 1 { self.walk(&args[0]); }
+                    if args.len() >= 2 { self.walk(&args[1]); }
+                }
+                BuiltinKind::ToStr => {
+                    if !args.is_empty() {
+                        let a = self.walk(&args[0]);
+                        if a != "i64" && a != "f64" { self.error("to_str expects i64 or f64", ""); }
+                    }
+                }
+                BuiltinKind::Sum => {
+                    if !args.is_empty() {
+                        let a = self.walk(&args[0]);
+                        if a != "array" { self.error("sum expects an array", ""); }
+                    }
+                }
+            }
+            return builtin_ret_type(b, args);
+        }
         // builtin signatures
         let ret = match name {
             "+" | "-" | "*" | "/" | "%" => {
@@ -1166,6 +1404,10 @@ impl Ctx {
                 Some(builder.ins().iconst(types::I64, 0))
             }
             Expr::Call(name, args) => {
+                // table-driven builtins (JIT)
+                if let Some(b) = lookup_builtin(name) {
+                    return self.jit_builtin(builder, vars, b, args);
+                }
                 if name == "+" && args.len() == 2 && (type_of(&args[0]) == "str" || type_of(&args[1]) == "str") {
                     let a = self.gen_expr(builder, vars, &args[0]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
                     let b = self.gen_expr(builder, vars, &args[1]).unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
@@ -2105,6 +2347,56 @@ fn collect_lets(e: &Expr, vars: &mut std::collections::HashMap<String, String>) 
     }
 }
 
+fn c_builtin(b: &Builtin, args: &[Expr]) -> Option<String> {
+    match b.kind {
+        BuiltinKind::UnaryF64(_) => {
+            let cn = if b.name == "ln" { "log" } else { b.name };
+            if !args.is_empty() { Some(format!("{}((double)({}))", cn, gen_c_expr(&args[0]))) } else { Some("0.0".into()) }
+        }
+        BuiltinKind::BinaryF64(_) => {
+            if args.len() >= 2 { Some(format!("pow((double)({}), (double)({}))", gen_c_expr(&args[0]), gen_c_expr(&args[1]))) } else { Some("0.0".into()) }
+        }
+        BuiltinKind::UnaryI64(_) => None, // not used by registry yet
+        BuiltinKind::BinaryI64(_) => None,
+        BuiltinKind::MinMax => {
+            if args.len() >= 2 {
+                let a = gen_c_expr(&args[0]); let bb = gen_c_expr(&args[1]);
+                if type_of(&args[0]) == "f64" || type_of(&args[1]) == "f64" {
+                    Some(format!("f{}((double)({}), (double)({}))", b.name, a, bb))
+                } else if b.name == "min" {
+                    Some(format!("ail_min_i64({}, {})", a, bb))
+                } else {
+                    Some(format!("ail_max_i64({}, {})", a, bb))
+                }
+            } else { Some("0".into()) }
+        }
+        BuiltinKind::Abs => {
+            if !args.is_empty() {
+                let v = gen_c_expr(&args[0]);
+                if type_of(&args[0]) == "f64" { Some(format!("fabs((double)({}))", v)) } else { Some(format!("ail_abs_i64({})", v)) }
+            } else { Some("0".into()) }
+        }
+        BuiltinKind::ToF64 => {
+            if !args.is_empty() {
+                // reuse to_f64 host? In C, cast
+                Some(format!("(double)({})", gen_c_expr(&args[0])))
+            } else { Some("0.0".into()) }
+        }
+        BuiltinKind::ToI64 => {
+            if !args.is_empty() { Some(format!("(long long)({})", gen_c_expr(&args[0]))) } else { Some("0".into()) }
+        }
+        BuiltinKind::ToStr => {
+            if !args.is_empty() {
+                let v = gen_c_expr(&args[0]);
+                if type_of(&args[0]) == "f64" { Some(format!("ail_to_str_f64({})", v)) } else { Some(format!("ail_to_str_i64({})", v)) }
+            } else { Some("NULL".into()) }
+        }
+        BuiltinKind::Sum => {
+            if !args.is_empty() { Some(format!("ail_sum({})", gen_c_expr(&args[0]))) } else { Some("0".into()) }
+        }
+    }
+}
+
 fn gen_c_expr(e: &Expr) -> String {
     match e {
         Expr::Int(n) => format!("{}", n),
@@ -2141,6 +2433,9 @@ fn gen_c_expr(e: &Expr) -> String {
             s
         }
         Expr::Call(name, args) => {
+            if let Some(b) = lookup_builtin(name) {
+                if let Some(s) = c_builtin(b, args) { return s; }
+            }
             match name.as_str() {
                 "+" | "-" | "*" | "/" | "%" => {
                     let isf = type_of(&args[0]) == "f64" || (args.len()>1 && type_of(&args[1]) == "f64");
@@ -2389,6 +2684,111 @@ fn llvm_type(t: &str) -> &'static str {
     match t { "i64" => "i64", "f64" => "double", "bool" => "i1", "str" => "i8*", "array" => "i8*", "mat" => "i8*", _ => "i64" }
 }
 
+fn llvm_builtin(b: &Builtin, args: &[Expr], ctx: &mut LlvmCtx, code: &mut String) -> Option<String> {
+    match b.kind {
+        BuiltinKind::UnaryF64(_) => {
+            let cn = if b.name == "ln" { "log" } else { b.name };
+            if !args.is_empty() {
+                let a = gen_llvm_expr(&args[0], ctx, code);
+                let av = if type_of(&args[0]) == "f64" { a } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, a)); v };
+                let v = ctx.temp();
+                code.push_str(&format!("  {} = call double @{}(double {})\n", v, cn, av));
+                Some(v)
+            } else { Some("0.0".into()) }
+        }
+        BuiltinKind::BinaryF64(_) => {
+            if args.len() >= 2 {
+                let a = gen_llvm_expr(&args[0], ctx, code);
+                let bb = gen_llvm_expr(&args[1], ctx, code);
+                let aw = if type_of(&args[0]) == "f64" { a } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, a)); v };
+                let bw = if type_of(&args[1]) == "f64" { bb } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, bb)); v };
+                let v = ctx.temp();
+                code.push_str(&format!("  {} = call double @pow(double {}, double {})\n", v, aw, bw));
+                Some(v)
+            } else { Some("0.0".into()) }
+        }
+        BuiltinKind::UnaryI64(_) => None,
+        BuiltinKind::BinaryI64(_) => None,
+        BuiltinKind::MinMax => {
+            if args.len() >= 2 {
+                let a = gen_llvm_expr(&args[0], ctx, code);
+                let bb = gen_llvm_expr(&args[1], ctx, code);
+                if type_of(&args[0]) == "f64" || type_of(&args[1]) == "f64" {
+                    let fnm = if b.name == "min" { "fmin" } else { "fmax" };
+                    let aw = if type_of(&args[0]) == "f64" { a } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, a)); v };
+                    let bw = if type_of(&args[1]) == "f64" { bb } else { let v = ctx.temp(); code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, bb)); v };
+                    let v = ctx.temp();
+                    code.push_str(&format!("  {} = call double @{}(double {}, double {})\n", v, fnm, aw, bw));
+                    Some(v)
+                } else {
+                    let cmp = ctx.temp();
+                    let v = ctx.temp();
+                    if b.name == "min" {
+                        code.push_str(&format!("  {} = icmp slt i64 {}, {}\n", cmp, a, bb));
+                    } else {
+                        code.push_str(&format!("  {} = icmp sgt i64 {}, {}\n", cmp, a, bb));
+                    }
+                    code.push_str(&format!("  {} = select i1 {}, i64 {}, i64 {}\n", v, cmp, a, bb));
+                    Some(v)
+                }
+            } else { Some("0".into()) }
+        }
+        BuiltinKind::Abs => {
+            if !args.is_empty() {
+                let a = gen_llvm_expr(&args[0], ctx, code);
+                if type_of(&args[0]) == "f64" {
+                    let v = ctx.temp();
+                    code.push_str(&format!("  {} = call double @fabs(double {})\n", v, a));
+                    Some(v)
+                } else {
+                    let n = ctx.temp(); let c = ctx.temp(); let v = ctx.temp();
+                    code.push_str(&format!("  {} = sub i64 0, {}\n", n, a));
+                    code.push_str(&format!("  {} = icmp slt i64 {}, 0\n", c, a));
+                    code.push_str(&format!("  {} = select i1 {}, i64 {}, i64 {}\n", v, c, n, a));
+                    Some(v)
+                }
+            } else { Some("0".into()) }
+        }
+        BuiltinKind::ToF64 => {
+            if !args.is_empty() {
+                let a = gen_llvm_expr(&args[0], ctx, code);
+                if type_of(&args[0]) == "f64" { Some(a) } else {
+                    let v = ctx.temp();
+                    code.push_str(&format!("  {} = sitofp i64 {} to double\n", v, a));
+                    Some(v)
+                }
+            } else { Some("0.0".into()) }
+        }
+        BuiltinKind::ToI64 => {
+            if !args.is_empty() {
+                let a = gen_llvm_expr(&args[0], ctx, code);
+                if type_of(&args[0]) == "f64" {
+                    let v = ctx.temp();
+                    code.push_str(&format!("  {} = fptosi double {} to i64\n", v, a));
+                    Some(v)
+                } else { Some(a) }
+            } else { Some("0".into()) }
+        }
+        BuiltinKind::ToStr => {
+            if !args.is_empty() {
+                let a = gen_llvm_expr(&args[0], ctx, code);
+                let buf = ctx.temp();
+                code.push_str(&format!("  {} = call i8* @malloc(i64 32)\n", buf));
+                if type_of(&args[0]) == "f64" {
+                    code.push_str(&format!("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* {}, i64 32, i8* getelementptr inbounds ([3 x i8], ptr @fmt_tstr_f64, i64 0, i64 0), double {})\n", buf, a));
+                } else {
+                    code.push_str(&format!("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* {}, i64 32, i8* getelementptr inbounds ([5 x i8], ptr @fmt_tstr_i64, i64 0, i64 0), i64 {})\n", buf, a));
+                }
+                Some(buf)
+            } else { Some("0".into()) }
+        }
+        BuiltinKind::Sum => {
+            eprintln!("error: 'sum' is not supported on the llvm backend (arrays are not lowered to LLVM yet)");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn gen_llvm_expr(e: &Expr, ctx: &mut LlvmCtx, code: &mut String) -> String {
     match e {
         Expr::Int(n) => format!("{}", n),
@@ -2473,6 +2873,9 @@ fn gen_llvm_expr(e: &Expr, ctx: &mut LlvmCtx, code: &mut String) -> String {
             if v.is_empty() { "0".into() } else { last }
         }
         Expr::Call(name, args) => {
+            if let Some(b) = lookup_builtin(name) {
+                if let Some(s) = llvm_builtin(b, args, ctx, code) { return s; }
+            }
             if name == "+" && args.len() == 2 && (type_of(&args[0]) == "str" || type_of(&args[1]) == "str") {
                 let a = gen_llvm_expr(&args[0], ctx, code);
                 let b = gen_llvm_expr(&args[1], ctx, code);
